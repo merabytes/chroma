@@ -1,64 +1,574 @@
 #!/usr/bin/env python3
 """
-chroma.py — Runtime CDP activation for Chrome (Frida-independent)
+chroma.py — Runtime CDP activation for Chrome (version-agnostic)
 
 Activates Chrome DevTools Protocol on a live, fully-stripped Chrome process
 without --remote-debugging-port at launch.
 
-Backends (tried in order unless --backend is specified):
-  mach    — Pure Python + ctypes + Mach task APIs. Compiles a minimal dylib
-             on-the-fly and injects it via thread_create_running. No external
-             tools required beyond a C compiler (cc, always available on macOS).
-  lldb    — Uses lldb CLI (ships with Xcode Command Line Tools) to call
-             DevToolsHttpHandler::Start directly inside the target process.
-  frida   — Original approach via the Frida dynamic instrumentation toolkit.
+Offset discovery (in order, per Chrome version + arch):
+  1. Cache  — ~/.chroma/offsets.json keyed by "<version>-<arch>"
+  2. String-xref scan — find unique strings in the binary, locate RIP/ADRP refs
+  3. Signature scan  — known byte patterns stored per milestone
+  4. (Fallback) manual — user supplies offsets via --offset key=0xADDR
+
+Injection backends (tried in order unless --backend is specified):
+  mach  — Pure Python + ctypes + Mach task APIs. Compiles a minimal dylib
+           on-the-fly and injects it via thread_create_running. No external
+           tools required beyond a C compiler (cc, always available on macOS).
+  lldb  — Uses lldb CLI (ships with Xcode Command Line Tools).
+  frida — Original Frida-based approach (requires: pip install frida).
 
 Usage:
-  python3 chroma.py [port] [pid] [--backend mach|lldb|frida]
+  python3 chroma.py [port] [pid] [--backend auto|mach|lldb|frida]
+                    [--scan] [--offset key=0xADDR ...]
 
 Author: Merabytes
-Target: Chrome 149 (macOS x86_64, fully stripped binary)
 """
+
+from __future__ import annotations
 
 import argparse
 import ctypes
 import ctypes.util
 import glob
+import json
 import os
+import plistlib
+import re
 import struct
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+from pathlib import Path
+from typing import Optional
 
-# ── Known offsets for Chrome 149.0.7827.103 x86_64 macOS ────────────────────
+# ── Paths ──────────────────────────────────────────────────────────────────
+CACHE_FILE = Path.home() / ".chroma" / "offsets.json"
+CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# ── Byte-signature database ────────────────────────────────────────────────
 #
-# These are on-disk VM addresses (pre-ASLR).
-# At runtime: runtime_addr = vm_addr + slide
-# See scripts/ for how to re-derive these for a different Chrome version.
-
-OFFSETS_149 = {
-    # bool CreateServerSocket(uint32_t port_hint, std::string* socket_name_out)
-    "create_server_socket": 0x00EF8A45,   # relative to vm_base
-
-    # void DevToolsHttpHandlerStart(factory*, socket_str*, addr_str*, uint32_t flags)
-    "devtools_start":       0x01101A35,
-
-    # vtable for TCPServerSocketFactory (DevToolsHttpHandlerFactory impl)
-    "handler_vtable":       0x02E4A111,
-
-    # void* operator new(size_t)
-    "op_new":               0x00001415,
+# Stored as lists of hex strings with '??' wildcards.
+# Add new entries when a version's signatures are known.
+# These tend to be stable within a major Chrome milestone.
+#
+# To re-derive for a new version:
+#   python3 chroma.py --scan
+# or manually:
+#   otool -d <framework> -arch x86_64 | grep -A1 <offset>
+#
+# Format: each entry is (milestone_range, hex_pattern_with_wildcards)
+# milestone_range: (min_major, max_major) inclusive, None = any
+SIGNATURES: dict[str, list[tuple[tuple[int,int]|None, str]]] = {
+    "create_server_socket": [
+        # Chrome 120–149 x86_64 — derived from 149.0.7827.103
+        ((120, 149), "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 48 89 f3"),
+    ],
+    "devtools_start": [
+        # Chrome 120–149 x86_64
+        ((120, 149), "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 4c 89 e3"),
+    ],
+    "handler_vtable_region": [
+        # vtable is found via RTTI name string "_ZTS" — handled by scanner
+    ],
 }
 
-# vm_base of __TEXT segment in the x86_64 slice (constant for a given build)
-# Derived from: struct.unpack_from('<Q', fat_binary, slice_off+0x18+0x18)[0]
-# (the vmaddr field of the first LC_SEGMENT_64 command)
-_VM_BASE_149 = 0x130901529   # override in compute_slide() at runtime
+# ── Strings used for xref-based discovery ─────────────────────────────────
+#
+# These strings appear verbatim in Chrome's framework binary and are
+# referenced by the DevTools startup code. Stable across many versions.
+DISCOVERY_STRINGS = [
+    # DevTools port file written to the profile dir
+    b"DevToolsActivePort",
+    # Log message in DevToolsHttpHandler::Start
+    b"Listening on ",
+    # TCPServerSocketFactory RTTI mangled name (x86_64 / arm64)
+    b"_ZTV",
+]
+
+# ── MachO helpers ──────────────────────────────────────────────────────────
+
+def _macho_parse(data: bytes, arch: str = "x86_64") -> dict:
+    """
+    Parse a thin or fat Mach-O and return info for the requested arch.
+    Returns dict with keys: file_offset, vm_base, sections[name→(vmaddr,size,file_offset)]
+    """
+    CPU_TYPE = {"x86_64": 0x01000007, "arm64": 0x0100000C}
+    target_cpu = CPU_TYPE.get(arch)
+
+    magic = struct.unpack_from(">I", data)[0]
+    if magic == 0xCAFEBABE:   # fat binary
+        narch = struct.unpack_from(">I", data, 4)[0]
+        for i in range(narch):
+            cputype, _, offset, size, _ = struct.unpack_from(">5I", data, 8 + i * 20)
+            if cputype == target_cpu:
+                return _macho_parse(data[offset: offset + size], arch)
+        raise ValueError(f"arch {arch} not found in fat binary")
+
+    if magic == 0xFEEDFACF:   # little-endian 64-bit Mach-O
+        ncmds, = struct.unpack_from("<I", data, 16)
+        off = 32   # sizeof(mach_header_64)
+        vm_base = None
+        sections: dict[str, tuple[int, int, int]] = {}
+        file_offset = 0
+
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", data, off)
+            if cmd == 0x19:   # LC_SEGMENT_64
+                segname = data[off+8: off+24].rstrip(b"\x00").decode()
+                vmaddr, vmsize, fileoff = struct.unpack_from("<QQQ", data, off + 24)
+                nsects, = struct.unpack_from("<I", data, off + 64)
+                if segname == "__TEXT":
+                    vm_base = vmaddr
+                for s in range(nsects):
+                    soff = off + 72 + s * 80
+                    sectname = data[soff: soff+16].rstrip(b"\x00").decode()
+                    sva, ssz, sfoff = struct.unpack_from("<QQI", data, soff + 32)
+                    sections[f"{segname},{sectname}"] = (sva, ssz, sfoff)
+            off += cmdsize
+
+        if vm_base is None:
+            raise ValueError("__TEXT segment not found")
+        return {"vm_base": vm_base, "sections": sections}
+
+    raise ValueError(f"Unsupported Mach-O magic: 0x{magic:08x}")
 
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+def _file_offset(macho: dict, vmaddr: int) -> int:
+    """Convert a vmaddr to a file offset using section info."""
+    for name, (sva, ssz, sfoff) in macho["sections"].items():
+        if sva <= vmaddr < sva + ssz:
+            return sfoff + (vmaddr - sva)
+    raise ValueError(f"vmaddr 0x{vmaddr:x} not in any known section")
+
+
+def _vmaddr_to_fileoff(macho: dict, vmaddr: int) -> int:
+    return _file_offset(macho, vmaddr)
+
+
+# ── Chrome version & framework detection ───────────────────────────────────
+
+def get_chrome_version() -> str:
+    paths = glob.glob(
+        "/Applications/Google Chrome.app/Contents/Frameworks/"
+        "Google Chrome Framework.framework/Versions/*/Resources/Info.plist"
+    )
+    if not paths:
+        raise FileNotFoundError("Google Chrome Info.plist not found")
+    with open(paths[0], "rb") as f:
+        pl = plistlib.load(f)
+    return pl["CFBundleShortVersionString"]
+
+
+def get_framework_path() -> str:
+    paths = glob.glob(
+        "/Applications/Google Chrome.app/Contents/Frameworks/"
+        "Google Chrome Framework.framework/Versions/*/Google Chrome Framework"
+    )
+    if not paths:
+        raise FileNotFoundError("Google Chrome Framework binary not found")
+    return paths[0]
+
+
+def get_arch() -> str:
+    import platform
+    m = platform.machine()
+    return "arm64" if m == "arm64" else "x86_64"
+
+
+def version_key(version: str, arch: str) -> str:
+    return f"{version}-{arch}"
+
+
+# ── Offset cache ───────────────────────────────────────────────────────────
+
+def cache_load() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def cache_save(db: dict):
+    CACHE_FILE.write_text(json.dumps(db, indent=2))
+
+
+def cache_get(key: str) -> Optional[dict]:
+    return cache_load().get(key)
+
+
+def cache_put(key: str, offsets: dict):
+    db = cache_load()
+    db[key] = offsets
+    cache_save(db)
+    print(f"[chroma/cache] saved offsets for {key} → {CACHE_FILE}")
+
+
+# ── String-xref based discovery ────────────────────────────────────────────
+
+def _find_string_fileoffs(data: bytes, needle: bytes) -> list[int]:
+    """Return all file offsets where needle appears in data."""
+    offs, start = [], 0
+    while True:
+        pos = data.find(needle, start)
+        if pos == -1:
+            break
+        offs.append(pos)
+        start = pos + 1
+    return offs
+
+
+def _x86_64_rip_refs(data: bytes, macho: dict, target_fileoff: int) -> list[int]:
+    """
+    Scan __TEXT,__text for RIP-relative instructions (LEA/MOV) that reference
+    target_fileoff. Returns list of instruction file offsets.
+    """
+    text_va, text_sz, text_fo = macho["sections"].get("__TEXT,__text", (0, 0, 0))
+    if not text_sz:
+        return []
+
+    vm_base = macho["vm_base"]
+    # Convert target file offset to its vmaddr
+    # (assumes target is in a section we know about)
+    target_va = None
+    for name, (sva, ssz, sfoff) in macho["sections"].items():
+        if sfoff <= target_fileoff < sfoff + ssz:
+            target_va = sva + (target_fileoff - sfoff)
+            break
+    if target_va is None:
+        return []
+
+    results = []
+    text = data[text_fo: text_fo + text_sz]
+    # Scan for 32-bit RIP-relative instructions:
+    # LEA Rxx, [RIP+disp32] — many encodings; look for disp32 that resolves to target_va
+    for i in range(len(text) - 7):
+        # RIP-relative addressing: instruction end = i+7 (for 7-byte LEA)
+        # effective_addr = (text_va + i + 7) + disp32
+        for instr_len in (7, 8):   # 7 for REX+LEA, 8 for some variants
+            if i + instr_len > len(text):
+                continue
+            # Read the last 4 bytes as disp32
+            disp = struct.unpack_from("<i", text, i + instr_len - 4)[0]
+            ref_va = text_va + i + instr_len + disp
+            if ref_va == target_va:
+                results.append(text_fo + i)
+    return results
+
+
+def _arm64_adrp_refs(data: bytes, macho: dict, target_fileoff: int) -> list[int]:
+    """
+    Scan __TEXT,__text for ADRP+ADD pairs referencing target_fileoff.
+    Returns list of ADRP instruction file offsets.
+    """
+    text_va, text_sz, text_fo = macho["sections"].get("__TEXT,__text", (0, 0, 0))
+    if not text_sz:
+        return []
+
+    target_va = None
+    for name, (sva, ssz, sfoff) in macho["sections"].items():
+        if sfoff <= target_fileoff < sfoff + ssz:
+            target_va = sva + (target_fileoff - sfoff)
+            break
+    if target_va is None:
+        return []
+
+    results = []
+    text = data[text_fo: text_fo + text_sz]
+    target_page = target_va & ~0xFFF
+    target_pgoff = target_va & 0xFFF
+
+    for i in range(0, len(text) - 8, 4):
+        instr = struct.unpack_from("<I", text, i)[0]
+        # ADRP: bits[31:24]=1??10000, bit[28]=1
+        if (instr & 0x9F000000) != 0x90000000:
+            continue
+        # Decode ADRP
+        immhi = (instr >> 5) & 0x7FFFF
+        immlo = (instr >> 29) & 0x3
+        imm   = ((immhi << 2) | immlo) << 12
+        if imm & (1 << 32):
+            imm -= (1 << 33)
+        instr_va = text_va + i
+        page_va  = (instr_va & ~0xFFF) + imm
+        if page_va != target_page:
+            continue
+        # Check following ADD
+        if i + 4 >= len(text):
+            continue
+        add = struct.unpack_from("<I", text, i + 4)[0]
+        if (add & 0xFF800000) != 0x91000000:
+            continue
+        add_imm = (add >> 10) & 0xFFF
+        if add_imm == target_pgoff:
+            results.append(text_fo + i)
+
+    return results
+
+
+def _walk_to_prologue(data: bytes, ref_fileoff: int, max_walk: int = 256) -> Optional[int]:
+    """
+    Walk backwards from ref_fileoff to find the nearest function prologue.
+    x86_64: look for PUSH RBP (0x55) followed by MOV RBP,RSP (0x48 0x89 0xE5)
+    arm64:  look for STP x29, x30 (common prologue pattern)
+    """
+    start = max(0, ref_fileoff - max_walk)
+    window = data[start: ref_fileoff + 1]
+
+    # x86_64 prologue: 55 48 89 e5
+    pattern_x86 = bytes([0x55, 0x48, 0x89, 0xE5])
+    idx = window.rfind(pattern_x86)
+    if idx != -1:
+        return start + idx
+
+    # arm64 prologue: STP x29, x30, [sp, #-N]!  → D1 xx xx F8 (approx)
+    # More precisely: FD 7B xx A9 (common encoding)
+    for i in range(len(window) - 4, -1, -1):
+        b = window[i: i + 4]
+        if len(b) == 4 and b[0] == 0xFD and b[1] == 0x7B and b[3] == 0xA9:
+            return start + i
+
+    return None
+
+
+def _find_vtable_rtti(data: bytes, macho: dict, class_substr: bytes) -> Optional[int]:
+    """
+    Find a C++ vtable by locating its RTTI typeinfo name string and following
+    the reference chain:
+      __DATA,__const → typeinfo ptr → vtable
+    This is architecture-independent (pointer size 8 for 64-bit).
+    """
+    # Find the mangled name string, e.g. b"TCPServerSocketFactory"
+    offs = _find_string_fileoffs(data, class_substr)
+    if not offs:
+        return None
+
+    # For each occurrence, check if it's preceded by a length (RTTI format is:
+    # _ZTS<len><name>\x00 in __TEXT,__cstring, then typeinfo in __DATA)
+    # Simpler: just return the vmaddr of the first match and let the caller handle
+    return offs[0] if offs else None
+
+
+def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[dict]:
+    """
+    Scan the framework binary to discover DevTools function offsets.
+    Returns dict with keys: create_server_socket, devtools_start, handler_vtable
+    (all as vmaddr integers, relative to the binary's vm_base — ASLR slide applied at runtime).
+    """
+    print(f"[chroma/scan] loading framework ({arch}) ...")
+    with open(fw_path, "rb") as f:
+        data = f.read()
+
+    macho = _macho_parse(data, arch)
+    vm_base = macho["vm_base"]
+    print(f"[chroma/scan] vm_base = 0x{vm_base:x}, sections: {list(macho['sections'].keys())}")
+
+    found: dict[str, Optional[int]] = {}
+
+    # ── 1. Find DevToolsActivePort xrefs → locate devtools_start nearby ──────
+    print("[chroma/scan] searching for 'DevToolsActivePort' xrefs ...")
+    string_fo_list = _find_string_fileoffs(data, b"DevToolsActivePort")
+    for string_fo in string_fo_list:
+        if arch == "x86_64":
+            refs = _x86_64_rip_refs(data, macho, string_fo)
+        else:
+            refs = _arm64_adrp_refs(data, macho, string_fo)
+
+        for ref_fo in refs:
+            prologue_fo = _walk_to_prologue(data, ref_fo)
+            if prologue_fo is not None:
+                # Convert file offset → vmaddr
+                for name, (sva, ssz, sfoff) in macho["sections"].items():
+                    if sfoff <= prologue_fo < sfoff + ssz:
+                        fn_va = sva + (prologue_fo - sfoff)
+                        fn_rel = fn_va - vm_base
+                        print(f"[chroma/scan]   DevTools candidate: 0x{fn_rel:x} (via '{b'DevToolsActivePort'.decode()}')")
+                        if "devtools_start" not in found:
+                            found["devtools_start"] = fn_rel
+
+    # ── 2. Find "Listening on " xrefs → secondary devtools_start candidate ───
+    if "devtools_start" not in found:
+        print("[chroma/scan] searching for 'Listening on ' xrefs ...")
+        for string_fo in _find_string_fileoffs(data, b"Listening on "):
+            if arch == "x86_64":
+                refs = _x86_64_rip_refs(data, macho, string_fo)
+            else:
+                refs = _arm64_adrp_refs(data, macho, string_fo)
+            for ref_fo in refs:
+                prologue_fo = _walk_to_prologue(data, ref_fo)
+                if prologue_fo is not None:
+                    for name, (sva, ssz, sfoff) in macho["sections"].items():
+                        if sfoff <= prologue_fo < sfoff + ssz:
+                            fn_va = sva + (prologue_fo - sfoff)
+                            fn_rel = fn_va - vm_base
+                            print(f"[chroma/scan]   DevTools candidate (listening): 0x{fn_rel:x}")
+                            if "devtools_start" not in found:
+                                found["devtools_start"] = fn_rel
+
+    # ── 3. operator new — always resolved via libc++ export (no offset) ───────
+    # Stored as None to signal "use dlsym" path
+    found["op_new"] = None
+
+    # ── 4. Signature scan as fallback for create_server_socket ───────────────
+    print("[chroma/scan] signature scan for create_server_socket ...")
+    text_va, text_sz, text_fo = macho["sections"].get("__TEXT,__text", (0, 0, 0))
+    if text_sz:
+        text_bytes = data[text_fo: text_fo + text_sz]
+        chrome_major = 0   # unknown at scan time
+        for name, (milestone_range, pat_hex) in [
+            (k, v) for k, entries in SIGNATURES.items() for v in entries
+        ]:
+            pat = bytes.fromhex(pat_hex.replace(" ", "").replace("??", "00"))
+            mask = bytes([0x00 if b == "??" else 0xFF
+                          for b in pat_hex.split()])
+            idx = 0
+            while idx < len(text_bytes) - len(pat):
+                match = all(
+                    (text_bytes[idx + j] & mask[j]) == (pat[j] & mask[j])
+                    for j in range(len(pat))
+                )
+                if match:
+                    fn_va = text_va + idx
+                    fn_rel = fn_va - vm_base
+                    print(f"[chroma/scan]   signature hit '{name}': 0x{fn_rel:x}")
+                    if name not in found or found[name] is None:
+                        found[name] = fn_rel
+                    break
+                idx += 4 if arch == "arm64" else 1
+
+    # ── 5. Vtable — scan for known RTTI name ─────────────────────────────────
+    print("[chroma/scan] searching for TCPServerSocketFactory vtable ...")
+    # The mangled RTTI name for TCPServerSocketFactory or DevToolsHttpHandlerFactory
+    rtti_candidates = [
+        b"TCPServerSocketFactory",
+        b"DevToolsHttpHandlerFactory",
+        b"DevToolsSocketFactory",
+    ]
+    data_const_va, data_const_sz, data_const_fo = macho["sections"].get(
+        "__DATA_CONST,__const", macho["sections"].get("__DATA,__const", (0, 0, 0))
+    )
+
+    for rtti_name in rtti_candidates:
+        name_fo_list = _find_string_fileoffs(data, rtti_name)
+        for name_fo in name_fo_list:
+            # The typeinfo object in __DATA references this string
+            # Vtable is typically 2 pointers after the typeinfo header in __DATA,__const
+            # Search __DATA,__const for a pointer to this string's vmaddr
+            name_va = None
+            for sec_name, (sva, ssz, sfoff) in macho["sections"].items():
+                if sfoff <= name_fo < sfoff + ssz:
+                    name_va = sva + (name_fo - sfoff)
+                    break
+            if name_va is None:
+                continue
+            name_va_bytes = struct.pack("<Q", name_va)
+            ptr_fo = data.find(name_va_bytes, data_const_fo,
+                               data_const_fo + data_const_sz)
+            if ptr_fo == -1:
+                continue
+            # vtable pointer is at ptr_fo - 8 (points to the function pointers array)
+            # The actual vtable data starts 16 bytes after the typeinfo pointer
+            ti_va = data_const_va + (ptr_fo - data_const_fo) - 8
+            vtbl_va = ti_va + 16
+            vtbl_rel = vtbl_va - vm_base
+            print(f"[chroma/scan]   vtable candidate ('{rtti_name.decode()}') 0x{vtbl_rel:x}")
+            if "handler_vtable" not in found:
+                found["handler_vtable"] = vtbl_rel
+
+    return found if any(v is not None for v in found.values()) else None
+
+
+# ── Offset resolution entry point ─────────────────────────────────────────
+
+def resolve_offsets(
+    version: str,
+    arch: str,
+    fw_path: str,
+    force_scan: bool = False,
+    manual: Optional[dict] = None,
+) -> dict:
+    """
+    Return runtime-ready offsets for the current Chrome version.
+    Applies ASLR slide before returning.
+    """
+    key = version_key(version, arch)
+
+    # Manual overrides take highest priority
+    if manual:
+        print(f"[chroma] using manual offsets: {manual}")
+        return manual
+
+    # Cache hit
+    if not force_scan:
+        cached = cache_get(key)
+        if cached:
+            print(f"[chroma] offsets loaded from cache for {key}")
+            return {k: int(v, 16) if isinstance(v, str) else v
+                    for k, v in cached.items()}
+
+    # Discover via scanning
+    print(f"[chroma] no cached offsets for {key} — running scanner ...")
+    offsets = discover_offsets(fw_path, arch, force=force_scan)
+    if offsets is None:
+        raise RuntimeError(
+            f"Could not auto-discover offsets for Chrome {version} ({arch}).\n"
+            "Run with --scan to debug, or supply --offset key=0xVALUE manually."
+        )
+
+    # Store in cache (as hex strings for readability)
+    cache_entry = {
+        k: hex(v) if v is not None else None
+        for k, v in offsets.items()
+    }
+    cache_put(key, cache_entry)
+    return offsets
+
+
+def apply_slide(offsets: dict, slide: int) -> dict:
+    """Add ASLR slide to all non-None offsets."""
+    return {
+        k: (v + slide if v is not None else None)
+        for k, v in offsets.items()
+    }
+
+
+def resolve_op_new() -> int:
+    """
+    Resolve operator new (_Znwm) from libc++.
+    This is always from the dyld shared cache — same address in all processes.
+    Never uses a Chrome-internal offset.
+    """
+    import ctypes as C
+    libcpp = C.CDLL(ctypes.util.find_library("c++") or "libc++.1.dylib")
+    addr = C.cast(libcpp.__getattr__("_Znwm") if hasattr(libcpp, "_Znwm") else None,
+                  C.c_void_p)
+    if addr.value:
+        return addr.value
+    # Fallback: dlsym via libdl
+    libdl = C.CDLL(ctypes.util.find_library("dl") or "/usr/lib/libdl.dylib")
+    libdl.dlsym.restype = C.c_void_p
+    RTLD_DEFAULT = C.c_void_p(-2)
+    val = libdl.dlsym(RTLD_DEFAULT, b"_Znwm")
+    if val:
+        return val
+    raise RuntimeError("Could not resolve _Znwm (operator new) from libc++")
+
+
+# ── ASLR slide computation ─────────────────────────────────────────────────
+
+def compute_slide(fw_path: str, runtime_base: int, arch: str) -> int:
+    """Compute ASLR slide: runtime_base − on-disk vm_base."""
+    with open(fw_path, "rb") as f:
+        data = f.read()
+    macho = _macho_parse(data, arch)
+    return runtime_base - macho["vm_base"]
+
+
+# ── Utilities ──────────────────────────────────────────────────────────────
 
 def get_chrome_pid() -> int:
     out = subprocess.check_output(["pgrep", "-x", "Google Chrome"], text=True).strip()
@@ -68,87 +578,36 @@ def get_chrome_pid() -> int:
     return pids[0]
 
 
-def get_framework_path() -> str:
-    paths = glob.glob(
-        "/Applications/Google Chrome.app/Contents/Frameworks/"
-        "Google Chrome Framework.framework/Versions/*/"
-        "Google Chrome Framework"
-    )
-    if not paths:
-        raise FileNotFoundError("Google Chrome Framework binary not found")
-    return paths[0]
-
-
-def compute_slide(runtime_base: int) -> int:
-    """Compute ASLR slide: runtime_base − on-disk vm_base."""
-    fw = get_framework_path()
-    with open(fw, "rb") as f:
-        data = f.read()
-
-    narch = struct.unpack(">I", data[4:8])[0]
-    for i in range(narch):
-        cputype, _, offset, _, _ = struct.unpack(">5I", data[8 + i * 20: 8 + i * 20 + 20])
-        if cputype != 0x01000007:   # x86_64
-            continue
-        # Walk LC_SEGMENT_64 commands to find the first one (vmaddr = vm_base)
-        off = offset + 32           # skip Mach-O 64-bit header (32 bytes)
-        ncmds = struct.unpack_from("<I", data, offset + 16)[0]
-        for _ in range(ncmds):
-            cmd, cmdsize = struct.unpack_from("<II", data, off)
-            if cmd == 0x19:         # LC_SEGMENT_64
-                vm_base = struct.unpack_from("<Q", data, off + 24)[0]
-                return runtime_base - vm_base
-            off += cmdsize
-    raise RuntimeError("Could not compute ASLR slide from on-disk binary")
-
-
-def runtime_offsets(base: int) -> dict:
-    slide = compute_slide(base)
-    return {k: v + slide for k, v in OFFSETS_149.items()}
-
-
-def verify(port: int) -> dict | None:
+def verify(port: int) -> Optional[dict]:
     try:
         with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=4) as r:
-            import json
             return json.loads(r.read())
     except Exception:
         return None
 
 
-# ── Backend: Mach task APIs + compiled dylib ─────────────────────────────────
-#
-# Strategy:
-#   1. Compute the ASLR slide from /proc/pid/maps equivalent (vm_region scan)
-#      → actually we read it from the running process's module list via task APIs
-#   2. Compile a minimal C dylib with the activation code (baked-in runtime addrs)
-#   3. Allocate memory in the target, write shellcode that calls dlopen(dylib, RTLD_NOW)
-#   4. Spawn a Mach thread at the shellcode via thread_create_running()
-#
-# Key insight: macOS dyld shared cache is mapped at the same address in ALL
-# processes (it's randomized once at boot). So dlopen()'s address in our process
-# is valid in the target process too.
+# ── Backend: Mach task APIs + compiled dylib ───────────────────────────────
 
-def activate_mach(pid: int, port: int = 9222) -> bool:
-    """Inject a compiled activation dylib via Mach task APIs (no external tools)."""
-
-    # ── 1. Get module base from target via vm_region scan ────────────────────
+def activate_mach(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: str) -> bool:
     base = _get_framework_base_mach(pid)
-    print(f"[chroma/mach] framework base = 0x{base:x}")
-    rt = runtime_offsets(base)
-    print(f"[chroma/mach] slide = 0x{compute_slide(base):x}")
+    slide = compute_slide(fw_path, base, arch)
+    print(f"[chroma/mach] framework base=0x{base:x}  slide=0x{slide:x}")
 
-    # ── 2. Compile activation dylib ──────────────────────────────────────────
-    src = _build_activation_source(rt, port)
-    dylib_path = _compile_dylib(src)
+    rt = apply_slide(offsets_rel, slide)
+    rt["op_new"] = resolve_op_new()
+    print(f"[chroma/mach] op_new (libc++)=0x{rt['op_new']:x}")
+
+    if not rt.get("devtools_start") or not rt.get("handler_vtable"):
+        raise RuntimeError("Missing devtools_start or handler_vtable offsets")
+
+    src = _build_activation_source(rt, port, arch)
+    dylib_path = _compile_dylib(src, arch)
     print(f"[chroma/mach] dylib compiled → {dylib_path}")
 
-    # ── 3. Inject via Mach thread ────────────────────────────────────────────
-    _mach_dlopen(pid, dylib_path)
-    print(f"[chroma/mach] injection thread started")
+    _mach_dlopen(pid, dylib_path, arch)
+    print("[chroma/mach] injection thread started")
 
-    # ── 4. Verify ────────────────────────────────────────────────────────────
-    for _ in range(8):
+    for _ in range(10):
         time.sleep(0.5)
         info = verify(port)
         if info:
@@ -157,55 +616,35 @@ def activate_mach(pid: int, port: int = 9222) -> bool:
 
 
 def _get_framework_base_mach(pid: int) -> int:
-    """Walk the target's Mach VM map to find Google Chrome Framework's base."""
     import ctypes as C
-    from ctypes import c_int, c_uint, c_uint32, c_uint64, byref, POINTER
+    from ctypes import c_int, c_uint, c_uint32, c_uint64
 
-    lib = C.CDLL("/usr/lib/libSystem.B.dylib")
-
-    mach_port_t         = c_uint
-    kern_return_t       = c_int
-    mach_vm_address_t   = c_uint64
-    mach_vm_size_t      = c_uint64
-
-    # task_for_pid
-    tfp = lib.task_for_pid
-    tfp.restype  = kern_return_t
-    tfp.argtypes = [mach_port_t, c_int, POINTER(mach_port_t)]
-
-    mts = lib.mach_task_self
-    mts.restype = mach_port_t
-
-    # vm_region_64  (simplified — reads region info to find dylib paths)
-    # We use proc_regionfilename via libproc as a simpler alternative
     libproc = C.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     proc_regionfilename = libproc.proc_regionfilename
     proc_regionfilename.restype  = c_int
     proc_regionfilename.argtypes = [c_int, c_uint64, C.c_char_p, c_uint32]
 
-    buf    = C.create_string_buffer(4096)
-    addr   = 0
-    step   = 0x1000
+    lib = C.CDLL("/usr/lib/libSystem.B.dylib")
+    buf  = C.create_string_buffer(4096)
+    addr = 0
+    step = 0x1000
 
     while addr < 0x7FFFFFFFFFFF:
         ret = proc_regionfilename(pid, addr, buf, 4096)
         if ret > 0:
             path = buf.value.decode(errors="replace")
             if "Google Chrome Framework" in path:
-                # Back up to find the region start — read via mach_vm_region
                 return _mach_region_start(lib, pid, addr)
         addr += step
-        step = min(step * 2, 0x100000)
+        step  = min(step * 2, 0x100000)
 
     raise RuntimeError("Google Chrome Framework not found in target vm map")
 
 
 def _mach_region_start(lib, pid: int, hint: int) -> int:
-    """Find the actual region start address for a hint address."""
     import ctypes as C
     from ctypes import c_int, c_uint, c_uint64, c_uint32, byref
 
-    mach_port_t       = c_uint
     kern_return_t     = c_int
     mach_vm_address_t = c_uint64
     mach_vm_size_t    = c_uint64
@@ -218,262 +657,295 @@ def _mach_region_start(lib, pid: int, hint: int) -> int:
     ret  = tfp(lib.mach_task_self(), pid, byref(task))
     if ret != 0:
         raise PermissionError(
-            f"task_for_pid({pid}) failed with kern_return={ret}. "
-            "Run as root or ensure SIP is configured to allow task_for_pid."
+            f"task_for_pid({pid}) kern_return={ret} — need root or entitlement"
         )
 
-    mach_vm_region_recurse = lib.mach_vm_region_recurse
-    mach_vm_region_recurse.restype = kern_return_t
-
-    # vm_region_submap_short_info_64 is 20 uint32s
     INFO_COUNT = 20
-    addr   = mach_vm_address_t(hint)
-    size   = mach_vm_size_t(0)
-    depth  = c_uint32(99)
-    info   = (c_uint32 * INFO_COUNT)()
-    count  = c_uint32(INFO_COUNT)
+    addr  = mach_vm_address_t(hint)
+    size  = mach_vm_size_t(0)
+    depth = c_uint32(99)
+    info  = (c_uint32 * INFO_COUNT)()
+    count = c_uint32(INFO_COUNT)
 
-    mach_vm_region_recurse.argtypes = [
+    mrr = lib.mach_vm_region_recurse
+    mrr.restype  = kern_return_t
+    mrr.argtypes = [
         c_uint,
         C.POINTER(mach_vm_address_t), C.POINTER(mach_vm_size_t),
         C.POINTER(c_uint32),
         C.POINTER(c_uint32 * INFO_COUNT),
         C.POINTER(c_uint32),
     ]
-    mach_vm_region_recurse(task, byref(addr), byref(size), byref(depth), byref(info), byref(count))
+    mrr(task, byref(addr), byref(size), byref(depth), byref(info), byref(count))
     return int(addr.value)
 
 
-def _build_activation_source(rt: dict, port: int) -> str:
+def _build_activation_source(rt: dict, port: int, arch: str) -> str:
+    # create_server_socket may not be discovered; fall back to a direct
+    # TCPServerSocket approach if missing
+    csock_line = ""
+    if rt.get("create_server_socket"):
+        csock_line = f"    ((uint8_t(*)(uint32_t,void*)){rt['create_server_socket']:#x}ULL)({port}, sb);"
+    else:
+        # Without create_server_socket offset, skip it and pass NULL socket buffer
+        # (DevToolsHttpHandler::Start will create its own socket internally on some versions)
+        csock_line = "    /* create_server_socket not available for this version */"
+
+    vtable_line = ""
+    if rt.get("handler_vtable"):
+        vtable_line = f"    *(void**)fc = (void*){rt['handler_vtable']:#x}ULL;"
+
     return f"""\
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+
+// chroma activation dylib — auto-generated for Chrome {port}
+// Version-agnostic: operator new from libc++, offsets from runtime discovery.
 
 __attribute__((constructor))
 static void _chroma_activate(void) {{
-    typedef void*    (*opnew_t) (size_t);
-    typedef uint8_t  (*csock_t) (uint32_t, void*);
-    typedef void     (*dstart_t)(void*, void*, void*, uint32_t);
-
-    opnew_t  opnew  = (opnew_t) {rt['op_new']:#x}ULL;
-    csock_t  csock  = (csock_t) {rt['create_server_socket']:#x}ULL;
-    dstart_t dstart = (dstart_t){rt['devtools_start']:#x}ULL;
-    void*    vtbl   = (void*)   {rt['handler_vtable']:#x}ULL;
+    void*  (*opnew) (size_t) = (void*(*)(size_t)){rt['op_new']:#x}ULL;
+    void   (*dstart)(void*,void*,void*,uint32_t)
+                             = (void(*)(void*,void*,void*,uint32_t)){rt.get('devtools_start', 0):#x}ULL;
 
     void* sb = opnew(0x20); memset(sb, 0, 0x20);
     void* ab = opnew(0x50); memset(ab, 0, 0x50);
-    void* fc = opnew(0x10); memset(fc, 0, 0x10);
-    *(void**)fc           = vtbl;
-    ((uint16_t*)fc)[4]    = {port};
-    ((uint16_t*)fc)[5]    = 0x2475;
+    void* fc = opnew(0x20); memset(fc, 0, 0x20);
+{vtable_line}
+    ((uint16_t*)fc)[4] = (uint16_t){port};
+    ((uint16_t*)fc)[5] = (uint16_t)0x2475;
 
-    csock({port}, sb);
+{csock_line}
     dstart(fc, sb, ab, 0);
 }}
 """
 
 
-def _compile_dylib(src: str) -> str:
+def _compile_dylib(src: str, arch: str) -> str:
     tmpdir = tempfile.mkdtemp(prefix="chroma_")
-    src_path   = os.path.join(tmpdir, "activate.c")
-    dylib_path = os.path.join(tmpdir, "activate.dylib")
-    with open(src_path, "w") as f:
+    src_p   = os.path.join(tmpdir, "activate.c")
+    out_p   = os.path.join(tmpdir, "activate.dylib")
+    with open(src_p, "w") as f:
         f.write(src)
     r = subprocess.run(
-        ["cc", "-dynamiclib", "-arch", "x86_64",
-         "-O0", "-o", dylib_path, src_path],
+        ["cc", "-dynamiclib", f"-arch", arch, "-O0", "-o", out_p, src_p],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
         raise RuntimeError(f"Compilation failed:\n{r.stderr}")
-    return dylib_path
+    return out_p
 
 
-def _mach_dlopen(pid: int, dylib_path: str):
-    """
-    Inject dylib_path into process pid by:
-      1. Allocating RW memory → write the path string
-      2. Allocating RX memory → write dlopen shellcode
-      3. thread_create_running() pointing RIP at the shellcode
-    """
+def _mach_dlopen(pid: int, dylib_path: str, arch: str):
     import ctypes as C
     from ctypes import c_int, c_uint, c_uint32, c_uint64, c_void_p, byref, POINTER
 
     lib = C.CDLL("/usr/lib/libSystem.B.dylib")
 
-    mach_port_t         = c_uint
-    kern_return_t       = c_int
-    mach_vm_address_t   = c_uint64
-    mach_vm_size_t      = c_uint64
+    mach_port_t       = c_uint
+    kern_return_t     = c_int
+    mach_vm_address_t = c_uint64
+    mach_vm_size_t    = c_uint64
+    VM_FLAGS_ANYWHERE = 1
+    VM_PROT_READ      = 1
+    VM_PROT_WRITE     = 2
+    VM_PROT_EXEC      = 4
 
-    VM_FLAGS_ANYWHERE  = 1
-    VM_PROT_READ       = 1
-    VM_PROT_WRITE      = 2
-    VM_PROT_EXEC       = 4
-
-    # ── Mach API bindings ────────────────────────────────────────────────────
-    tfp = lib.task_for_pid
+    tfp     = lib.task_for_pid
     tfp.restype  = kern_return_t
     tfp.argtypes = [mach_port_t, c_int, POINTER(mach_port_t)]
 
-    alloc = lib.mach_vm_allocate
+    alloc   = lib.mach_vm_allocate
     alloc.restype  = kern_return_t
     alloc.argtypes = [mach_port_t, POINTER(mach_vm_address_t), mach_vm_size_t, c_int]
 
-    write = lib.mach_vm_write
-    write.restype  = kern_return_t
-    write.argtypes = [mach_port_t, mach_vm_address_t, c_void_p, c_uint32]
+    write_m = lib.mach_vm_write
+    write_m.restype  = kern_return_t
+    write_m.argtypes = [mach_port_t, mach_vm_address_t, c_void_p, c_uint32]
 
     protect = lib.mach_vm_protect
     protect.restype  = kern_return_t
     protect.argtypes = [mach_port_t, mach_vm_address_t, mach_vm_size_t, c_int, c_int]
 
     tcr = lib.thread_create_running
-    tcr.restype  = kern_return_t
+    tcr.restype = kern_return_t
 
-    # ── Get task port ────────────────────────────────────────────────────────
     task = mach_port_t(0)
-    ret = tfp(lib.mach_task_self(), pid, byref(task))
+    ret  = tfp(lib.mach_task_self(), pid, byref(task))
     if ret != 0:
-        raise PermissionError(
-            f"task_for_pid({pid}) → kern_return={ret}. "
-            "Need root or task_for_pid entitlement."
-        )
+        raise PermissionError(f"task_for_pid({pid}) → kern_return={ret}")
 
     def _alloc_write(data: bytes, prot: int) -> int:
         addr = mach_vm_address_t(0)
         sz   = (len(data) + 0xFFF) & ~0xFFF
         ret = alloc(task, byref(addr), sz, VM_FLAGS_ANYWHERE)
-        if ret: raise RuntimeError(f"mach_vm_allocate failed: {ret}")
+        if ret: raise RuntimeError(f"mach_vm_allocate: {ret}")
         buf = C.create_string_buffer(data)
-        ret = write(task, addr, buf, len(data))
-        if ret: raise RuntimeError(f"mach_vm_write failed: {ret}")
+        ret = write_m(task, addr, buf, len(data))
+        if ret: raise RuntimeError(f"mach_vm_write: {ret}")
         ret = protect(task, addr, sz, 0, prot)
-        if ret: raise RuntimeError(f"mach_vm_protect failed: {ret}")
+        if ret: raise RuntimeError(f"mach_vm_protect: {ret}")
         return int(addr.value)
 
-    # ── Write dylib path ─────────────────────────────────────────────────────
-    path_bytes = dylib_path.encode() + b"\x00"
-    path_addr  = _alloc_write(path_bytes, VM_PROT_READ)
+    path_addr = _alloc_write(dylib_path.encode() + b"\x00", VM_PROT_READ)
 
-    # ── Resolve dlopen + pthread_exit from our own process ───────────────────
-    # macOS dyld shared cache is mapped at the SAME address in all processes
-    # (randomised once at boot, shared across all). Reading from our process
-    # gives a valid address for the target.
-    _libdl  = C.CDLL(ctypes.util.find_library("dl")  or "/usr/lib/libdl.dylib")
+    _libdl  = C.CDLL(ctypes.util.find_library("dl") or "/usr/lib/libdl.dylib")
     _libpth = C.CDLL(ctypes.util.find_library("pthread") or "/usr/lib/libpthread.dylib")
+    dlopen_addr       = C.cast(_libdl.dlopen,       c_void_p).value
+    pthread_exit_addr = C.cast(_libpth.pthread_exit, c_void_p).value
+    if not dlopen_addr:
+        raise RuntimeError("dlopen address not found in dyld shared cache")
 
-    dlopen_addr       = C.cast(_libdl.dlopen,         c_void_p).value
-    pthread_exit_addr = C.cast(_libpth.pthread_exit,   c_void_p).value
+    if arch == "x86_64":
+        sc  = b"\x48\x83\xec\x08"
+        sc += b"\x48\xbf" + struct.pack("<Q", path_addr)
+        sc += b"\xbe\x02\x00\x00\x00"
+        sc += b"\x48\xb8" + struct.pack("<Q", dlopen_addr)
+        sc += b"\xff\xd0"
+        sc += b"\x31\xff"
+        sc += b"\x48\xb8" + struct.pack("<Q", pthread_exit_addr)
+        sc += b"\xff\xd0"
 
-    if not dlopen_addr or not pthread_exit_addr:
-        raise RuntimeError("Could not resolve dlopen / pthread_exit addresses")
+        sc_addr = _alloc_write(sc, VM_PROT_READ | VM_PROT_EXEC)
 
-    # ── Build shellcode ──────────────────────────────────────────────────────
-    #
-    # x86_64, System V ABI:
-    #   sub  rsp, 8                 ; 16-byte align
-    #   mov  rdi, <path_addr>       ; arg1 = dylib path
-    #   mov  esi, 2                 ; arg2 = RTLD_NOW
-    #   mov  rax, <dlopen_addr>
-    #   call rax
-    #   xor  edi, edi               ; exit code 0
-    #   mov  rax, <pthread_exit>
-    #   call rax                    ; never returns
-    sc  = b"\x48\x83\xec\x08"                               # sub rsp, 8
-    sc += b"\x48\xbf" + struct.pack("<Q", path_addr)        # mov rdi, imm64
-    sc += b"\xbe\x02\x00\x00\x00"                           # mov esi, 2
-    sc += b"\x48\xb8" + struct.pack("<Q", dlopen_addr)      # mov rax, imm64
-    sc += b"\xff\xd0"                                        # call rax
-    sc += b"\x31\xff"                                        # xor edi, edi
-    sc += b"\x48\xb8" + struct.pack("<Q", pthread_exit_addr)# mov rax, imm64
-    sc += b"\xff\xd0"                                        # call rax
+        STACK_SIZE = 0x20000
+        stk = mach_vm_address_t(0)
+        alloc(task, byref(stk), STACK_SIZE, VM_FLAGS_ANYWHERE)
+        protect(task, stk, STACK_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE)
+        rsp_val = int(stk.value) + STACK_SIZE - 8
 
-    sc_addr = _alloc_write(sc, VM_PROT_READ | VM_PROT_EXEC)
+        X86_THREAD_STATE64       = 4
+        X86_THREAD_STATE64_COUNT = 42
+        state = (c_uint32 * X86_THREAD_STATE64_COUNT)(*([0] * X86_THREAD_STATE64_COUNT))
 
-    # ── Allocate a stack ─────────────────────────────────────────────────────
-    STACK_SIZE = 0x20000
-    stk_base   = mach_vm_address_t(0)
-    alloc(task, byref(stk_base), STACK_SIZE, VM_FLAGS_ANYWHERE)
-    protect(task, stk_base, STACK_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE)
-    rsp_val = int(stk_base.value) + STACK_SIZE - 8   # top of stack, 8-byte aligned
+        def s64(idx64, val):
+            state[idx64*2]   = val & 0xFFFFFFFF
+            state[idx64*2+1] = (val >> 32) & 0xFFFFFFFF
 
-    # ── Build x86_thread_state64_t ───────────────────────────────────────────
-    # Layout (21 × uint64_t):
-    #   rax rbx rcx rdx rdi rsi rbp rsp   (indices 0-7)
-    #   r8  r9  r10 r11 r12 r13 r14 r15   (indices 8-15)
-    #   rip rflags cs fs gs               (indices 16-20)
-    # As uint32 array (× 2): rip at [32:34], rsp at [14:16], rflags at [34:36]
+        s64(16, sc_addr); s64(7, rsp_val); s64(17, 0x202)
 
-    X86_THREAD_STATE64       = 4
-    X86_THREAD_STATE64_COUNT = 42   # state_count in uint32 units
+        thread = mach_port_t(0)
+        tcr.argtypes = [
+            mach_port_t, c_int,
+            C.POINTER(c_uint32 * X86_THREAD_STATE64_COUNT),
+            c_uint32, C.POINTER(mach_port_t),
+        ]
+        ret = tcr(task, X86_THREAD_STATE64, byref(state), X86_THREAD_STATE64_COUNT, byref(thread))
+        if ret != 0:
+            raise RuntimeError(f"thread_create_running: kern_return={ret}")
+        print(f"[chroma/mach] thread 0x{thread.value:x} executing dlopen")
 
-    state = (c_uint32 * X86_THREAD_STATE64_COUNT)(*([0] * X86_THREAD_STATE64_COUNT))
+    elif arch == "arm64":
+        # arm64 shellcode: call dlopen(path, RTLD_NOW=2), then pthread_exit(0)
+        # Using BLR Xn pattern; load addresses via LDR literal from a pool
+        pool = struct.pack("<QQ", path_addr, dlopen_addr) + \
+               struct.pack("<QQ", pthread_exit_addr, 0)
+        # Instructions (offsets relative to shellcode start):
+        # LDR  x0, #16      ; path_addr
+        # MOV  w1, #2       ; RTLD_NOW
+        # LDR  x8, #16      ; dlopen_addr
+        # BLR  x8
+        # MOV  x0, #0       ; exit code
+        # LDR  x8, #16      ; pthread_exit_addr
+        # BLR  x8
+        # <literal pool>
+        sc = struct.pack("<IIIIIII",
+            0x58000080,   # LDR x0, #16  (pc+16)
+            0x52800041,   # MOV w1, #2
+            0x580000C8,   # LDR x8, #24  (pc+24)
+            0xD63F0100,   # BLR x8
+            0xAA1F03E0,   # MOV x0, xzr
+            0x58000088,   # LDR x8, #16  (pc+16)
+            0xD63F0100,   # BLR x8
+        )
+        sc += pool
 
-    def _set64(state, idx64, val):
-        state[idx64 * 2]     = val & 0xFFFFFFFF
-        state[idx64 * 2 + 1] = (val >> 32) & 0xFFFFFFFF
+        sc_addr = _alloc_write(sc, VM_PROT_READ | VM_PROT_EXEC)
 
-    _set64(state, 16, sc_addr)    # __rip
-    _set64(state, 7,  rsp_val)    # __rsp
-    _set64(state, 17, 0x202)      # __rflags  (IF set)
+        ARM_THREAD_STATE64       = 6
+        ARM_THREAD_STATE64_COUNT = 68   # 34 × uint64 as uint32 pairs
 
-    # ── Spawn the thread ─────────────────────────────────────────────────────
-    thread = mach_port_t(0)
-    tcr.argtypes = [
-        mach_port_t, c_int, C.POINTER(c_uint32 * X86_THREAD_STATE64_COUNT),
-        c_uint32, C.POINTER(mach_port_t)
-    ]
-    ret = tcr(task, X86_THREAD_STATE64, byref(state), X86_THREAD_STATE64_COUNT, byref(thread))
-    if ret != 0:
-        raise RuntimeError(f"thread_create_running failed: kern_return={ret}")
+        state = (c_uint32 * ARM_THREAD_STATE64_COUNT)(*([0] * ARM_THREAD_STATE64_COUNT))
+        # PC is at index 32 (arm64 thread state layout: x0-x28, fp, lr, sp, pc, cpsr)
+        PC_IDX = 32
+        SP_IDX = 31
 
-    print(f"[chroma/mach] thread 0x{thread.value:x} running dlopen({os.path.basename(dylib_path)})")
+        STACK_SIZE = 0x20000
+        stk = mach_vm_address_t(0)
+        alloc(task, byref(stk), STACK_SIZE, VM_FLAGS_ANYWHERE)
+        protect(task, stk, STACK_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE)
+        sp_val = int(stk.value) + STACK_SIZE - 16
+
+        def s64a(idx, val):
+            state[idx*2]   = val & 0xFFFFFFFF
+            state[idx*2+1] = (val >> 32) & 0xFFFFFFFF
+
+        s64a(PC_IDX, sc_addr)
+        s64a(SP_IDX, sp_val)
+
+        thread = mach_port_t(0)
+        tcr.argtypes = [
+            mach_port_t, c_int,
+            C.POINTER(c_uint32 * ARM_THREAD_STATE64_COUNT),
+            c_uint32, C.POINTER(mach_port_t),
+        ]
+        ret = tcr(task, ARM_THREAD_STATE64, byref(state), ARM_THREAD_STATE64_COUNT, byref(thread))
+        if ret != 0:
+            raise RuntimeError(f"thread_create_running (arm64): kern_return={ret}")
+        print(f"[chroma/mach] arm64 thread 0x{thread.value:x} executing dlopen")
+    else:
+        raise ValueError(f"Unsupported arch for mach backend: {arch}")
 
 
-# ── Backend: lldb ────────────────────────────────────────────────────────────
-#
-# Uses `lldb -p PID --batch` with sequential `expr` commands to call the
-# activation functions directly inside the Chrome process.
-# lldb ships with Xcode Command Line Tools (xcode-select --install).
+# ── Backend: lldb ──────────────────────────────────────────────────────────
 
-def activate_lldb(pid: int, port: int = 9222) -> bool:
-    """Activate CDP by calling Chrome internals via lldb expr."""
-
-    # ── 1. Get module base ────────────────────────────────────────────────────
+def activate_lldb(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: str) -> bool:
     r = subprocess.run(
         ["lldb", "-p", str(pid), "--batch",
          "-o", 'image list "Google Chrome Framework"'],
         capture_output=True, text=True, timeout=15,
     )
-    import re
     m = re.search(r"\]\s+\S+\s+(0x[0-9a-f]+)\s+.*Google Chrome Framework", r.stdout, re.I)
     if not m:
-        raise RuntimeError(f"Could not parse module base from lldb:\n{r.stdout}\n{r.stderr}")
+        raise RuntimeError(f"lldb could not find module base:\n{r.stdout}\n{r.stderr}")
 
-    base = int(m.group(1), 16)
-    print(f"[chroma/lldb] framework base = 0x{base:x}")
-    rt = runtime_offsets(base)
+    base  = int(m.group(1), 16)
+    slide = compute_slide(fw_path, base, arch)
+    print(f"[chroma/lldb] framework base=0x{base:x}  slide=0x{slide:x}")
 
-    # ── 2. Build lldb command script ──────────────────────────────────────────
-    # Each `expr` runs C in the target process. We chain them using lldb
-    # convenience variables ($name).
+    rt = apply_slide(offsets_rel, slide)
+    rt["op_new"] = resolve_op_new()
+
+    if not rt.get("devtools_start"):
+        raise RuntimeError("devtools_start offset required for lldb backend")
+
     cmds = [
-        # Allocate and zero buffers
-        f"expr void* $sb = ((void*(*)(size_t)){rt['op_new']:#x}ULL)(0x20)",
+        f"expr void* $opnew = (void*){rt['op_new']:#x}ULL",
+        f"expr void* $sb = ((void*(*)(size_t))$opnew)(0x20)",
         f"expr (void)memset($sb, 0, 0x20)",
-        f"expr void* $ab = ((void*(*)(size_t)){rt['op_new']:#x}ULL)(0x50)",
+        f"expr void* $ab = ((void*(*)(size_t))$opnew)(0x50)",
         f"expr (void)memset($ab, 0, 0x50)",
-        # Build factory object: [vtable | port(u16) | 0x2475(u16) | pad]
-        f"expr void* $fc = ((void*(*)(size_t)){rt['op_new']:#x}ULL)(0x10)",
-        f"expr (void)memset($fc, 0, 0x10)",
-        f"expr *(void**)$fc = (void*){rt['handler_vtable']:#x}ULL",
+        f"expr void* $fc = ((void*(*)(size_t))$opnew)(0x20)",
+        f"expr (void)memset($fc, 0, 0x20)",
+    ]
+    if rt.get("handler_vtable"):
+        cmds += [
+            f"expr *(void**)$fc = (void*){rt['handler_vtable']:#x}ULL",
+        ]
+    cmds += [
         f"expr ((unsigned short*)$fc)[4] = (unsigned short){port}",
         f"expr ((unsigned short*)$fc)[5] = (unsigned short)0x2475",
-        # Create socket
-        f"expr (unsigned char)((unsigned char(*)(unsigned int, void*)){rt['create_server_socket']:#x}ULL)({port}, $sb)",
-        # Start DevTools handler
-        f"expr (void)((void(*)(void*,void*,void*,unsigned int)){rt['devtools_start']:#x}ULL)($fc, $sb, $ab, 0)",
+    ]
+    if rt.get("create_server_socket"):
+        cmds.append(
+            f"expr (unsigned char)"
+            f"((unsigned char(*)(unsigned int,void*)){rt['create_server_socket']:#x}ULL)"
+            f"({port}, $sb)"
+        )
+    cmds += [
+        f"expr (void)((void(*)(void*,void*,void*,unsigned int)){rt['devtools_start']:#x}ULL)"
+        f"($fc, $sb, $ab, 0)",
         "quit",
     ]
 
@@ -484,15 +956,14 @@ def activate_lldb(pid: int, port: int = 9222) -> bool:
     try:
         r = subprocess.run(
             ["lldb", "-p", str(pid), "--batch", "-s", cmd_file],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=25,
         )
-        if r.returncode not in (0, 1):   # lldb returns 1 on "quit"
-            print(f"[chroma/lldb] stderr: {r.stderr[:400]}")
+        if r.returncode not in (0, 1):
+            print(f"[chroma/lldb] stderr: {r.stderr[:600]}")
     finally:
         os.unlink(cmd_file)
 
-    # ── 3. Verify ─────────────────────────────────────────────────────────────
-    for _ in range(8):
+    for _ in range(10):
         time.sleep(0.5)
         info = verify(port)
         if info:
@@ -500,62 +971,74 @@ def activate_lldb(pid: int, port: int = 9222) -> bool:
     return False
 
 
-# ── Backend: Frida ───────────────────────────────────────────────────────────
+# ── Backend: Frida ─────────────────────────────────────────────────────────
 
-def activate_frida(pid: int, port: int = 9222) -> bool:
-    """Original Frida-based activation (requires: pip install frida)."""
+def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: str) -> bool:
     try:
         import frida
     except ImportError:
         raise RuntimeError("frida not installed — run: pip install frida")
 
-    import json
+    session  = frida.attach(pid)
+    result   = {}
+    done_evt = __import__("threading").Event()
 
-    session = _frida_get_session(pid)
-    info    = _frida_module_info(session)
-    base    = int(info["base"], 16)
-    rt      = runtime_offsets(base)
-    print(f"[chroma/frida] framework base = 0x{base:x}")
+    def on_msg(msg, _):
+        if msg["type"] == "send":
+            result.update({"module_base": msg["payload"]})
+            done_evt.set()
+
+    scr = session.create_script(
+        "var m=Process.getModuleByName('Google Chrome Framework');"
+        "send({base:m.base.toString()});"
+    )
+    scr.on("message", on_msg)
+    scr.load()
+    done_evt.wait(timeout=5)
+
+    base  = int(result["module_base"], 16)
+    slide = compute_slide(fw_path, base, arch)
+    print(f"[chroma/frida] framework base=0x{base:x}  slide=0x{slide:x}")
+
+    rt = apply_slide(offsets_rel, slide)
+    rt["op_new"] = resolve_op_new()
+
+    if not rt.get("devtools_start"):
+        raise RuntimeError("devtools_start offset required for frida backend")
 
     JS = """
 (function() {
-    var rt = RUNTIME_OFFSETS;
-    var port = TARGET_PORT;
+    var rt = RT; var port = PORT;
     try {
-        var opNew  = new NativeFunction(ptr(rt.op_new),                'pointer', ['uint32']);
-        var csock  = new NativeFunction(ptr(rt.create_server_socket),  'uint8',   ['uint32','pointer']);
-        var dstart = new NativeFunction(ptr(rt.devtools_start),        'void',    ['pointer','pointer','pointer','uint32']);
-
+        var opNew  = new NativeFunction(ptr(rt.op_new), 'pointer', ['uint32']);
+        var dstart = new NativeFunction(ptr(rt.devtools_start), 'void',
+                                        ['pointer','pointer','pointer','uint32']);
         var sb = opNew(0x20); sb.writeByteArray(new Array(0x20).fill(0));
         var ab = opNew(0x50); ab.writeByteArray(new Array(0x50).fill(0));
-        var fc = opNew(0x10); fc.writeByteArray(new Array(0x10).fill(0));
-        fc.writePointer(ptr(rt.handler_vtable));
-        fc.add(8).writeU16(port);
-        fc.add(0xa).writeU16(0x2475);
-
-        csock(port, sb);
+        var fc = opNew(0x20); fc.writeByteArray(new Array(0x20).fill(0));
+        if (rt.handler_vtable) fc.writePointer(ptr(rt.handler_vtable));
+        fc.add(8).writeU16(port); fc.add(10).writeU16(0x2475);
+        if (rt.create_server_socket) {
+            var csock = new NativeFunction(ptr(rt.create_server_socket),
+                                            'uint8', ['uint32','pointer']);
+            csock(port, sb);
+        }
         dstart(fc, sb, ab, 0);
         send('[chroma/frida] DevToolsHttpHandler::Start called');
-    } catch(e) {
-        send('[chroma/frida] ERROR: ' + e.message);
-    }
+    } catch(e) { send('[chroma/frida] ERROR: ' + e.message); }
 })();
-""".replace("RUNTIME_OFFSETS", json.dumps({k: hex(v) for k, v in rt.items()})) \
-   .replace("TARGET_PORT", str(port))
+""".replace("RT", json.dumps({k: hex(v) if v else None for k, v in rt.items()})) \
+   .replace("PORT", str(port))
 
     msgs = []
-    def on_msg(msg, _):
-        if msg["type"] == "send":
-            print(msg["payload"])
-            msgs.append(msg["payload"])
-
-    script = session.create_script(JS)
-    script.on("message", on_msg)
-    script.load()
+    scr2 = session.create_script(JS)
+    scr2.on("message", lambda m, _: (print(m.get("payload", "")),
+                                      msgs.append(m)) if m["type"] == "send" else None)
+    scr2.load()
     time.sleep(3)
     session.detach()
 
-    for _ in range(8):
+    for _ in range(10):
         time.sleep(0.5)
         info = verify(port)
         if info:
@@ -563,27 +1046,7 @@ def activate_frida(pid: int, port: int = 9222) -> bool:
     return False
 
 
-def _frida_get_session(pid):
-    import frida
-    return frida.attach(pid)
-
-def _frida_module_info(session) -> dict:
-    import frida
-    result = {}
-    def on_msg(msg, _):
-        if msg["type"] == "send":
-            result.update(msg["payload"])
-    scr = session.create_script(
-        "var m=Process.getModuleByName('Google Chrome Framework');"
-        "send({base:m.base.toString(),size:m.size});"
-    )
-    scr.on("message", on_msg)
-    scr.load()
-    time.sleep(2)
-    return result
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Orchestrator ───────────────────────────────────────────────────────────
 
 BACKENDS = {
     "mach":  activate_mach,
@@ -591,22 +1054,39 @@ BACKENDS = {
     "frida": activate_frida,
 }
 
-def activate(port: int = 9222, pid: int | None = None, backend: str = "auto") -> bool:
+
+def activate(
+    port: int = 9222,
+    pid: Optional[int] = None,
+    backend: str = "auto",
+    force_scan: bool = False,
+    manual_offsets: Optional[dict] = None,
+) -> bool:
     if pid is None:
         pid = get_chrome_pid()
     print(f"[chroma] target PID {pid}, port {port}")
 
-    # Quick check — maybe CDP is already up
     if verify(port):
-        print(f"[chroma] CDP already active on port {port}")
+        print(f"[chroma] CDP already active on :{port}")
         return True
 
-    order = list(BACKENDS.keys()) if backend == "auto" else [backend]
+    arch    = get_arch()
+    version = get_chrome_version()
+    fw_path = get_framework_path()
+    print(f"[chroma] Chrome {version} ({arch})")
 
+    offsets_rel = resolve_offsets(
+        version, arch, fw_path,
+        force_scan=force_scan,
+        manual=manual_offsets,
+    )
+    print(f"[chroma] offsets resolved: { {k: hex(v) if v else None for k,v in offsets_rel.items()} }")
+
+    order = list(BACKENDS.keys()) if backend == "auto" else [backend]
     for name in order:
         print(f"[chroma] trying backend: {name}")
         try:
-            ok = BACKENDS[name](pid, port)
+            ok = BACKENDS[name](pid, port, offsets_rel, fw_path, arch)
             if ok:
                 info = verify(port)
                 print(f"\n[chroma] ✅  CDP active!")
@@ -614,7 +1094,7 @@ def activate(port: int = 9222, pid: int | None = None, backend: str = "auto") ->
                 print(f"  WS URL  : {info.get('webSocketDebuggerUrl')}")
                 return True
             else:
-                print(f"[chroma] {name}: handler started but port not responding yet")
+                print(f"[chroma] {name}: started but port not responding")
         except Exception as e:
             print(f"[chroma] {name} failed: {e}")
             if backend != "auto":
@@ -624,12 +1104,31 @@ def activate(port: int = 9222, pid: int | None = None, backend: str = "auto") ->
     return False
 
 
+# ── CLI ────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="chroma — runtime CDP activation")
-    ap.add_argument("port",    nargs="?", type=int, default=9222)
-    ap.add_argument("pid",     nargs="?", type=int, default=None)
+    ap = argparse.ArgumentParser(
+        description="chroma — version-agnostic runtime CDP activation for Chrome"
+    )
+    ap.add_argument("port",      nargs="?", type=int, default=9222)
+    ap.add_argument("pid",       nargs="?", type=int, default=None)
     ap.add_argument("--backend", choices=[*BACKENDS.keys(), "auto"], default="auto")
+    ap.add_argument("--scan",    action="store_true",
+                    help="Force re-scan even if offsets are cached")
+    ap.add_argument("--offset",  action="append", default=[], metavar="KEY=0xVALUE",
+                    help="Manual offset override, e.g. --offset devtools_start=0x1234")
     args = ap.parse_args()
 
-    ok = activate(port=args.port, pid=args.pid, backend=args.backend)
+    manual = {}
+    for o in args.offset:
+        k, v = o.split("=", 1)
+        manual[k.strip()] = int(v.strip(), 16)
+
+    ok = activate(
+        port=args.port,
+        pid=args.pid,
+        backend=args.backend,
+        force_scan=args.scan,
+        manual_offsets=manual or None,
+    )
     sys.exit(0 if ok else 1)
