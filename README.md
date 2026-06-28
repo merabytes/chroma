@@ -230,20 +230,45 @@ After calling this, `curl http://localhost:9222/json/version` returns:
 
 ---
 
+## Backends
+
+Three injection strategies, tried in order (or select with `--backend`):
+
+| Backend | Dependency | How it works |
+|---|---|---|
+| `mach` | `cc` (ships with Xcode CLT) | Compiles a minimal activation dylib on-the-fly, allocates RWX memory in the target via Mach task APIs, writes shellcode that calls `dlopen()`, and spawns a thread via `thread_create_running`. **No pip packages required.** |
+| `lldb` | `lldb` (ships with Xcode CLT) | Attaches with `lldb -p <pid> --batch`, evaluates a sequence of `expr` C statements that call `op_new`, `CreateServerSocket`, and `DevToolsHttpHandlerStart` directly. |
+| `frida` | `pip install frida` | Original approach: attaches via Frida, calls the activation functions through `NativeFunction`. |
+
+> **Default is `auto`**: tries `mach` → `lldb` → `frida` in order, uses the first one that works.
+
+Both `mach` and `lldb` require `task_for_pid` access. On macOS without SIP:
+- Running as **root** grants task_for_pid unconditionally.
+- As a normal user: `cc` must be available (`xcode-select --install`).
+
+---
+
 ## Requirements
 
 ```
-frida >= 17.0
-frida-tools
-numpy
 Python >= 3.11
 macOS 13+ (x86_64)
 Chrome 149 (other versions need offset re-derivation — see scripts/)
+
+# mach backend (default — no pip packages):
+cc  (Xcode Command Line Tools: xcode-select --install)
+
+# lldb backend:
+lldb  (ships with Xcode Command Line Tools)
+
+# frida backend (optional):
+pip install frida frida-tools
 ```
 
-Install:
+Install optional deps:
 ```bash
-pip3 install frida frida-tools numpy
+# Frida backend only
+pip3 install frida frida-tools
 ```
 
 ---
@@ -251,7 +276,7 @@ pip3 install frida frida-tools numpy
 ## Usage
 
 ```bash
-# Default: port 9222, auto-detect Chrome PID
+# Default: auto backend, port 9222, auto-detect Chrome PID
 python3 chroma.py
 
 # Custom port
@@ -260,9 +285,14 @@ python3 chroma.py 9223
 # Explicit PID
 python3 chroma.py 9222 89638
 
+# Force a specific backend
+python3 chroma.py --backend mach
+python3 chroma.py --backend lldb
+python3 chroma.py --backend frida
+
 # Verify manually
 curl http://localhost:9222/json/version
-curl http://localhost:9222/json        # list all tabs
+curl http://localhost:9222/json        # list all open tabs
 ```
 
 ---
