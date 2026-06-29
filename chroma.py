@@ -98,8 +98,10 @@ def _macho_parse(data: bytes, arch: str = "x86_64") -> dict:
     CPU_TYPE = {"x86_64": 0x01000007, "arm64": 0x0100000C}
     target_cpu = CPU_TYPE.get(arch)
 
-    magic = struct.unpack_from(">I", data)[0]
-    if magic == 0xCAFEBABE:   # fat binary
+    magic_be = struct.unpack_from(">I", data)[0]
+    magic_le = struct.unpack_from("<I", data)[0]
+
+    if magic_be == 0xCAFEBABE:   # fat binary — header is always big-endian
         narch = struct.unpack_from(">I", data, 4)[0]
         for i in range(narch):
             cputype, _, offset, size, _ = struct.unpack_from(">5I", data, 8 + i * 20)
@@ -107,7 +109,7 @@ def _macho_parse(data: bytes, arch: str = "x86_64") -> dict:
                 return _macho_parse(data[offset: offset + size], arch)
         raise ValueError(f"arch {arch} not found in fat binary")
 
-    if magic == 0xFEEDFACF:   # little-endian 64-bit Mach-O
+    if magic_le == 0xFEEDFACF:   # little-endian 64-bit Mach-O
         ncmds, = struct.unpack_from("<I", data, 16)
         off = 32   # sizeof(mach_header_64)
         vm_base = None
@@ -133,7 +135,7 @@ def _macho_parse(data: bytes, arch: str = "x86_64") -> dict:
             raise ValueError("__TEXT segment not found")
         return {"vm_base": vm_base, "sections": sections}
 
-    raise ValueError(f"Unsupported Mach-O magic: 0x{magic:08x}")
+    raise ValueError(f"Unsupported Mach-O magic: LE=0x{magic_le:08x} BE=0x{magic_be:08x}")
 
 
 def _file_offset(macho: dict, vmaddr: int) -> int:
