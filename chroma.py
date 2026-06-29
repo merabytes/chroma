@@ -1297,10 +1297,10 @@ def _build_activation_source(rt: dict, port: int, arch: str) -> str:
 
     vtable_line = ""
     if rt.get("handler_vtable"):
-        # On arm64/arm64e Apple Silicon, __DATA_CONST,__const vtable entries are PAC-signed
-        # by dyld at load time.  Writing the raw/on-disk address causes EXC_ARM_DA_ALIGN
-        # (pointer authentication failure).  We must read the already-resolved pointer from
-        # the live process memory (double-dereference the vtable slot).
+        # NOTE: on arm64 this backend is not used by default (arm64 auto-selects frida).
+        # The vtable slot in __DATA_CONST,__const is PAC-signed by dyld; writing the raw
+        # on-disk value would cause EXC_ARM_DA_ALIGN.  We read the already-resolved pointer
+        # from the live process memory via double-dereference.
         vtable_line = f"    *(void**)fc = **(void***){rt['handler_vtable']:#x}ULL;"
 
     return f"""\
@@ -1744,7 +1744,19 @@ def activate(
     )
     print(f"[chroma] offsets resolved: { {k: hex(v) if v else None for k,v in offsets_rel.items()} }")
 
-    order = list(BACKENDS.keys()) if backend == "auto" else [backend]
+    # On arm64 (Apple Silicon), the mach backend compiles and dlopen()s a dylib whose
+    # LDR-literal encodings are broken and whose vtable write triggers PAC failures —
+    # the same crash we've been chasing.  Frida's NativeFunction approach never touches
+    # raw pointers in the injected code, so it doesn't hit either issue.
+    # Skip mach (and lldb, which has similar raw-pointer issues) on arm64 and go straight
+    # to the Frida WebSocket backend, which is the method that originally worked.
+    if backend == "auto":
+        if arch == "arm64":
+            order = ["frida", "lldb", "mach"]
+        else:
+            order = list(BACKENDS.keys())
+    else:
+        order = [backend]
     for name in order:
         print(f"[chroma] trying backend: {name}")
         try:
