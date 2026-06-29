@@ -153,6 +153,11 @@ Read the vtable pointer from live process memory (already resolved + PAC-signed 
 ### Cache
 `~/.chroma/offsets.json` was manually cleared. On next run it will rescan for `.116-arm64`.
 
+### Backend order (arm64)
+`auto` on arm64 now tries: `frida → lldb → mach`  
+Mach is broken on arm64 for two reasons (LDR literal encodings wrong, PAC on __DATA_CONST).  
+Frida is the original working method — NativeFunction calls over WebSocket, no injected code.
+
 ---
 
 ## Immediate next step
