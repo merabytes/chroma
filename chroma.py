@@ -599,7 +599,7 @@ def _frida_scan_offsets(arch: str) -> dict:
                     if (page.equals(pageTarget)) {
                         var rel = findPrologue(instrVA);
                         if (rel !== null && !results[targets[t].key]) {
-                            results[targets[t].key] = rel.toString();
+                            results[targets[t].key] = rel.toString(16);
                         }
                         break;
                     }
@@ -635,7 +635,7 @@ def _frida_scan_offsets(arch: str) -> dict:
                     if (ptrs.length > 0) {
                         // vtable = found pointer + 16 bytes (skip RTTI header)
                         var vtbl = ptrs[0].address.add(16);
-                        results.handler_vtable = vtbl.sub(base).toString();
+                        results.handler_vtable = vtbl.sub(base).toString(16);
                     }
                 }
             }
@@ -688,13 +688,19 @@ def resolve_offsets(
         print(f"[chroma] using manual offsets: {manual}")
         return manual
 
-    # Cache hit
+    # Cache hit — but only if it contains the critical offsets
+    REQUIRED = {"devtools_start"}
     if not force_scan:
         cached = cache_get(key)
         if cached:
-            print(f"[chroma] offsets loaded from cache for {key}")
-            return {k: int(v, 16) if isinstance(v, str) else v
-                    for k, v in cached.items()}
+            cached_parsed = {k: int(v, 16) if isinstance(v, str) else v
+                             for k, v in cached.items()}
+            missing_req = [r for r in REQUIRED if not cached_parsed.get(r)]
+            if missing_req:
+                print(f"[chroma] cache for {key} is incomplete (missing: {missing_req}), re-scanning ...")
+            else:
+                print(f"[chroma] offsets loaded from cache for {key}")
+                return cached_parsed
 
     # Discover via scanning
     print(f"[chroma] no cached offsets for {key} — running scanner ...")
