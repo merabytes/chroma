@@ -1628,7 +1628,12 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
 
     def on_msg(msg, _):
         if msg["type"] == "send":
-            result.update({"module_base": msg["payload"]})
+            payload = msg["payload"]
+            # payload is {"base": "0x..."} — extract the string
+            if isinstance(payload, dict):
+                result["module_base"] = payload.get("base", "")
+            else:
+                result["module_base"] = str(payload)
             done_evt.set()
 
     scr = session.create_script(
@@ -1638,6 +1643,9 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
     scr.on("message", on_msg)
     scr.load()
     done_evt.wait(timeout=5)
+
+    if not result.get("module_base"):
+        raise RuntimeError("frida: failed to get Google Chrome Framework base — timeout or module not found")
 
     base  = int(result["module_base"], 16)
     slide = compute_slide(fw_path, base, arch)
