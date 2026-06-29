@@ -509,7 +509,7 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
 def _frida_scan_offsets(arch: str) -> dict:
     """
     Use Frida to scan the live Chrome process for DevTools function addresses.
-    Searches for known strings in memory and backtracks to function prologues.
+    Uses NativePointer arithmetic throughout to avoid JS 32-bit integer overflow.
     Returns offsets relative to the framework vm_base (ASLR-independent).
     """
     frida = _import_frida()
@@ -517,145 +517,190 @@ def _frida_scan_offsets(arch: str) -> dict:
     session = frida.attach(pid)
 
     result: dict = {}
+    errors: list = []
     import threading
     done = threading.Event()
 
+    # Language: Frida JS (V8). All address arithmetic via NativePointer to avoid
+    # 32-bit overflow. arm64 ADRP+LDR/ADD decoded with BigInt for safety.
     JS = r"""
 (function() {
-    var mod = Process.getModuleByName('Google Chrome Framework');
-    var base = mod.base;
-    var modSize = mod.size;
     var results = {};
+    var errs = [];
 
-    // Helper: walk backwards from an address to find a function prologue.
-    // arm64: look for STP x29,x30,[sp,...] (fd 7b ?? a9)
-    // x86_64: look for PUSH RBP; MOV RBP,RSP (55 48 89 e5)
+    try {
+        var mod = Process.getModuleByName('Google Chrome Framework');
+    } catch(e) {
+        send({__error: 'module not found: ' + e.message});
+        return;
+    }
+
+    var base    = mod.base;
+    var modEnd  = base.add(mod.size);
+    var arch    = Process.arch;
+
+    // ── Helper: walk backwards to find function prologue ──────────────────
     function findPrologue(addr) {
-        var arch = Process.arch;
         var step = (arch === 'arm64') ? 4 : 1;
-        var maxWalk = 512;
-        for (var i = step; i < maxWalk; i += step) {
+        for (var i = step; i <= 1024; i += step) {
             var p = addr.sub(i);
+            if (p.compare(base) < 0) break;
             try {
                 var b = p.readByteArray(4);
                 var v = new Uint8Array(b);
                 if (arch === 'arm64') {
-                    // STP x29, x30, [sp, #-N]! → FD 7B xx A9
-                    if (v[0] === 0xFD && v[1] === 0x7B && v[3] === 0xA9) {
-                        return p.sub(base);
-                    }
+                    // STP x29, x30, [sp, #-N]!  →  FD 7B ?? A9
+                    if (v[0] === 0xFD && v[1] === 0x7B && v[3] === 0xA9) return p;
+                    // PACIBSP / PACIASP (hint #25 / #27) — also a valid prologue marker
+                    if (v[0] === 0x5F && v[1] === 0x23 && v[2] === 0x03 && v[3] === 0xD5) return p;
+                    if (v[0] === 0xFF && v[1] === 0x23 && v[2] === 0x03 && v[3] === 0xD5) return p;
                 } else {
-                    // PUSH RBP (55) + MOV RBP,RSP (48 89 E5)
-                    if (v[0] === 0x55 && v[1] === 0x48 && v[2] === 0x89 && v[3] === 0xE5) {
-                        return p.sub(base);
-                    }
+                    if (v[0] === 0x55 && v[1] === 0x48 && v[2] === 0x89 && v[3] === 0xE5) return p;
                 }
             } catch(e) { break; }
         }
         return null;
     }
 
-    // Search for "DevToolsActivePort" string in the module's __TEXT
-    var targets = [
-        { str: 'DevToolsActivePort', key: 'devtools_start' },
-        { str: 'Listening on ',      key: 'devtools_start' },
-    ];
+    // ── Helper: string → Frida scan pattern ──────────────────────────────
+    function strPattern(s) {
+        var out = [];
+        for (var i = 0; i < s.length; i++)
+            out.push(('0' + s.charCodeAt(i).toString(16)).slice(-2));
+        return out.join(' ');
+    }
 
-    for (var t = 0; t < targets.length; t++) {
-        if (results[targets[t].key]) continue;
+    // ── Helper: decode arm64 ADRP at a NativePointer, return page NativePointer
+    function decodeAdrp(instrPtr) {
+        var b = instrPtr.readByteArray(4);
+        var v = new Uint8Array(b);
+        var instr = v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24);
+        if ((instr & 0x9F000000) !== 0x90000000) return null;
+        // Use BigInt to avoid 32-bit overflow
+        var instrBig = BigInt(instr) & BigInt('0xFFFFFFFF');
+        var immhi = Number((instrBig >> BigInt(5)) & BigInt('0x7FFFF'));
+        var immlo = Number((instrBig >> BigInt(29)) & BigInt(3));
+        var imm21 = (immhi << 2) | immlo;
+        // Sign extend 21-bit → 32-bit
+        if (imm21 & (1 << 20)) imm21 = imm21 - (1 << 21);
+        // Page offset = imm21 * 4096
+        var pageOff = imm21 * 4096;
+        // instrPage = instrPtr & ~0xFFF
+        var instrAddr = Number(BigInt('0x' + instrPtr.toString(16)) & BigInt('0xFFFFFFFFFFFFF000'));
+        var targetPage = instrAddr + pageOff;
+        return ptr(targetPage.toString());
+    }
+
+    // ── Scan for a string and find the function that references it ────────
+    function findFnForString(needle, label) {
         try {
-            var matches = Memory.scanSync(base, modSize, targets[t].str
-                .split('').map(function(c) { return ('0'+c.charCodeAt(0).toString(16)).slice(-2); })
-                .join(' '));
-            for (var m = 0; m < matches.length; m++) {
-                // Find all references to this address within __TEXT
-                var strAddr = matches[m].address;
-                // Scan __TEXT for pointer or ADRP/LDR references to this addr
-                // Simplified: scan for the lower 32-bit page ref (ADRP) within 10MB
-                var pageTarget = strAddr.and(ptr('0xFFFFFFFFFFFFF000'));
-                var found = Memory.scanSync(base, Math.min(modSize, 10*1024*1024),
-                    pageTarget.toMatchPattern ? pageTarget.toMatchPattern() :
-                    pageTarget.toString(16).padStart(16,'0').match(/../g).reverse().join(' '));
-                // Fallback: just walk forward and find any instruction that loads near strAddr
-                // Use a simpler heuristic: look in the 2MB before the string for xrefs
-                var searchBase = strAddr.sub(2*1024*1024);
-                if (searchBase.compare(base) < 0) searchBase = base;
-                var searchSize = strAddr.sub(searchBase).toInt32();
-                if (searchSize < 4) continue;
-                // Scan for the page address encoded as an ADRP imm21
-                var strPage = strAddr.shr(12);
-                var scanBuf = searchBase.readByteArray(searchSize);
-                var arr = new Uint32Array(scanBuf);
+            var matches = Memory.scanSync(base, mod.size, strPattern(needle));
+            if (matches.length === 0) {
+                errs.push(label + ': string not found in memory');
+                return null;
+            }
+            for (var mi = 0; mi < matches.length; mi++) {
+                var strAddr = matches[mi].address;
+                var strPage = ptr((Number(BigInt('0x' + strAddr.toString(16)) & BigInt('0xFFFFFFFFFFFFF000'))).toString());
+
+                // Scan the 4MB of code before the string for ADRP instructions
+                // that target the same 4K page as strAddr
+                var scanStart = strAddr.sub(4 * 1024 * 1024);
+                if (scanStart.compare(base) < 0) scanStart = base;
+                var scanSize  = strAddr.sub(scanStart).toInt32();
+                if (scanSize < 4) continue;
+
+                var buf  = scanStart.readByteArray(scanSize);
+                var arr  = new Uint32Array(buf);
+                // Walk backwards from the string (most likely callers are just before it)
                 for (var i = arr.length - 1; i >= 0; i--) {
-                    var instr = arr[i];
-                    // ADRP: bits[31:29]=100, bit[28]=1, bit[24]=0
-                    if ((instr & 0x9F000000) !== 0x90000000) continue;
-                    var immhi = (instr >> 5) & 0x7FFFF;
-                    var immlo = (instr >> 29) & 0x3;
-                    var imm = ((immhi << 2) | immlo) << 12;
-                    if (imm & 0x100000000) imm = imm - 0x200000000;
-                    var instrVA = searchBase.add(i * 4);
-                    var page = instrVA.and(ptr('0xFFFFFFFFFFFFF000')).add(imm);
-                    if (page.equals(pageTarget)) {
-                        var rel = findPrologue(instrVA);
-                        if (rel !== null && !results[targets[t].key]) {
-                            results[targets[t].key] = rel.toString(16);
+                    var instrPtr = scanStart.add(i * 4);
+                    var page = decodeAdrp(instrPtr);
+                    if (page === null) continue;
+                    if (page.equals(strPage)) {
+                        var prologue = findPrologue(instrPtr);
+                        if (prologue) {
+                            errs.push(label + ': found at ' + prologue.toString(16) +
+                                      ' (xref from ' + instrPtr.sub(base).toString(16) + ')');
+                            return prologue.sub(base).toString(16);
                         }
-                        break;
                     }
                 }
-                if (results[targets[t].key]) break;
+                errs.push(label + ': ADRP xref not found in 4MB window before string');
             }
-        } catch(e) {}
+        } catch(e) {
+            errs.push(label + ': exception: ' + e.message + '\n' + e.stack);
+        }
+        return null;
     }
 
-    // Vtable: find TCPServerSocketFactory RTTI string → typeinfo → vtable
-    var vtblCandidates = ['TCPServerSocketFactory', 'DevToolsHttpHandlerFactory'];
-    for (var v = 0; v < vtblCandidates.length && !results.handler_vtable; v++) {
+    // ── DevTools start: try multiple stable strings ───────────────────────
+    var devtoolsStrings = ['DevToolsActivePort', 'Listening on '];
+    for (var di = 0; di < devtoolsStrings.length && !results.devtools_start; di++) {
+        var r = findFnForString(devtoolsStrings[di], 'devtools_start[' + devtoolsStrings[di] + ']');
+        if (r) results.devtools_start = r;
+    }
+
+    // ── Vtable: RTTI name → typeinfo ptr → vtable ─────────────────────────
+    var vtblNames = ['TCPServerSocketFactory', 'DevToolsHttpHandlerFactory'];
+    for (var vi = 0; vi < vtblNames.length && !results.handler_vtable; vi++) {
         try {
-            var ms = Memory.scanSync(base, modSize,
-                vtblCandidates[v].split('').map(function(c) {
-                    return ('0'+c.charCodeAt(0).toString(16)).slice(-2);
-                }).join(' '));
-            if (ms.length > 0) {
-                var nameAddr = ms[0].address;
-                // Search __DATA for a pointer to nameAddr
-                var dataSeg = null;
-                Process.enumerateRanges('r--').forEach(function(r) {
-                    if (!dataSeg && r.base.compare(base) > 0 &&
-                        r.base.compare(base.add(modSize)) < 0 &&
-                        r.size > 0x1000) {
-                        dataSeg = r;
-                    }
-                });
-                if (dataSeg) {
-                    var nameBytes = nameAddr.toString(16).padStart(16,'0')
-                        .match(/../g).reverse().join(' ');
-                    var ptrs = Memory.scanSync(dataSeg.base, dataSeg.size, nameBytes);
-                    if (ptrs.length > 0) {
-                        // vtable = found pointer + 16 bytes (skip RTTI header)
-                        var vtbl = ptrs[0].address.add(16);
-                        results.handler_vtable = vtbl.sub(base).toString(16);
-                    }
+            var ms = Memory.scanSync(base, mod.size, strPattern(vtblNames[vi]));
+            if (ms.length === 0) continue;
+            var nameAddr = ms[0].address;
+            // Encode nameAddr as little-endian 8-byte pattern
+            var na = BigInt('0x' + nameAddr.toString(16));
+            var naBytes = [];
+            for (var bi = 0; bi < 8; bi++) {
+                naBytes.push(('0' + Number(na & BigInt(0xFF)).toString(16)).slice(-2));
+                na = na >> BigInt(8);
+            }
+            var ptrPat = naBytes.join(' ');
+            // Scan all readable ranges within the module for a pointer to nameAddr
+            var ranges = Process.enumerateRanges('r--');
+            for (var ri = 0; ri < ranges.length && !results.handler_vtable; ri++) {
+                var r2 = ranges[ri];
+                if (r2.base.compare(base) < 0 || r2.base.compare(modEnd) > 0) continue;
+                var ptrs2 = Memory.scanSync(r2.base, r2.size, ptrPat);
+                if (ptrs2.length > 0) {
+                    var vtbl = ptrs2[0].address.add(16);
+                    results.handler_vtable = vtbl.sub(base).toString(16);
+                    errs.push('handler_vtable: found via ' + vtblNames[vi]);
                 }
             }
-        } catch(e) {}
+        } catch(e) {
+            errs.push('handler_vtable[' + vtblNames[vi] + ']: ' + e.message);
+        }
     }
 
-    send(results);
+    send({results: results, errors: errs});
 })();
 """
 
-    def on_msg(msg, _):
+    def on_msg(msg, data):
         if msg["type"] == "send":
-            result.update(msg["payload"])
+            payload = msg["payload"]
+            if isinstance(payload, dict) and "results" in payload:
+                result.update(payload["results"])
+                for e in payload.get("errors", []):
+                    errors.append(e)
+            elif isinstance(payload, dict) and "__error" in payload:
+                errors.append(payload["__error"])
+            done.set()
+        elif msg["type"] == "error":
+            errors.append(f"script error: {msg.get('description')} @ {msg.get('lineNumber')}")
             done.set()
 
     scr = session.create_script(JS)
     scr.on("message", on_msg)
     scr.load()
-    done.wait(timeout=15)
+    done.wait(timeout=20)
     session.detach()
+
+    if errors:
+        print(f"[chroma/frida-scan] diagnostics:")
+        for e in errors:
+            print(f"  {e}")
 
     # Convert hex strings to relative ints
     out = {}
@@ -663,8 +708,8 @@ def _frida_scan_offsets(arch: str) -> dict:
         if v:
             try:
                 out[k] = int(v, 16)
-            except ValueError:
-                pass
+            except (ValueError, TypeError):
+                print(f"[chroma/frida-scan] bad value for {k}: {v!r}")
     return out
 
 
