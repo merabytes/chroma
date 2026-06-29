@@ -562,9 +562,10 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
                         break
                     import struct as _struct
                     instr = _struct.unpack_from("<I", data, fo)[0]
-                    # MOV Wn, #0x2475 → encoding: MOVZ Wn, #0x2475 = 0xD284_8E8n
-                    # General: (instr >> 23) == 0x1A5 and ((instr >> 5) & 0xFFFF) == 0x2475
-                    if (instr >> 23) == 0x1A5 and ((instr >> 5) & 0xFFFF) == 0x2475:
+                    # MOV Wn, #0x2475 → encoding: MOVZ Wn, #0x2475 = 0x5284_8En (32-bit, sf=0)
+                    # General: (instr >> 23) == 0x0A5 (sf=0, opc=10, movz) and ((instr >> 5) & 0xFFFF) == 0x2475
+                    # NOTE: was wrongly 0x1A5 (64-bit MOVZ Xn) — chrome uses Wn (32-bit)
+                    if (instr >> 23) == 0x0A5 and ((instr >> 5) & 0xFFFF) == 0x2475:
                         # Found the 0x2475 flags write — scan forward for next BL
                         for bl_fo in range(fo + 4, min(fo + 0x40, scan_end), 4):
                             if bl_fo + 4 > len(data):
@@ -949,8 +950,8 @@ def _frida_scan_offsets(arch: str) -> dict:
                 var fwdArr = new Uint32Array(fwdBuf);
                 for (var fi = 0; fi < fwdArr.length && !results.devtools_start; fi++) {
                     var finstr = fwdArr[fi];
-                    // MOVZ Wn, #0x2475: (instr >> 23) == 0x1A5 && ((instr >> 5) & 0xFFFF) == 0x2475
-                    if ((finstr >>> 23) === 0x1A5 && ((finstr >>> 5) & 0xFFFF) === 0x2475) {
+                    // MOVZ Wn, #0x2475 (32-bit, sf=0): (instr >> 23) == 0x0A5 && ((instr >> 5) & 0xFFFF) == 0x2475
+                    if ((finstr >>> 23) === 0x0A5 && ((finstr >>> 5) & 0xFFFF) === 0x2475) {
                         errs.push('devtools_start: found 0x2475 at offset ' + (fi * 4));
                         // Scan forward for next BL (0x94xxxxxx)
                         for (var bli = fi + 1; bli < Math.min(fi + 16, fwdArr.length); bli++) {
@@ -1296,7 +1297,11 @@ def _build_activation_source(rt: dict, port: int, arch: str) -> str:
 
     vtable_line = ""
     if rt.get("handler_vtable"):
-        vtable_line = f"    *(void**)fc = (void*){rt['handler_vtable']:#x}ULL;"
+        # On arm64/arm64e Apple Silicon, __DATA_CONST,__const vtable entries are PAC-signed
+        # by dyld at load time.  Writing the raw/on-disk address causes EXC_ARM_DA_ALIGN
+        # (pointer authentication failure).  We must read the already-resolved pointer from
+        # the live process memory (double-dereference the vtable slot).
+        vtable_line = f"    *(void**)fc = **(void***){rt['handler_vtable']:#x}ULL;"
 
     return f"""\
 #include <stdint.h>
@@ -1670,7 +1675,11 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
         var sb = opNew(0x20); sb.writeByteArray(new Array(0x20).fill(0));
         var ab = opNew(0x50); ab.writeByteArray(new Array(0x50).fill(0));
         var fc = opNew(fcSize); fc.writeByteArray(new Array(fcSize).fill(0));
-        if (rt.handler_vtable) fc.writePointer(ptr(rt.handler_vtable));
+        // Read the vtable pointer from the already-resolved process memory.
+        // On arm64/arm64e, __DATA_CONST,__const entries are PAC-signed by dyld at load time.
+        // Writing the on-disk value directly would bypass PAC and cause EXC_ARM_DA_ALIGN.
+        // Dereferencing the vtable location gives us the live, PAC-signed pointer.
+        if (rt.handler_vtable) fc.writePointer(ptr(rt.handler_vtable).readPointer());
         fc.add(8).writeU16(port); fc.add(10).writeU16(0x2475);
         if (rt.create_server_socket) {{
             var csock = new NativeFunction(ptr(rt.create_server_socket),
