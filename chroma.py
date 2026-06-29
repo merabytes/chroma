@@ -61,17 +61,23 @@ CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 #
 # Format: each entry is (milestone_range, hex_pattern_with_wildcards)
 # milestone_range: (min_major, max_major) inclusive, None = any
-SIGNATURES: dict[str, list[tuple[tuple[int,int]|None, str]]] = {
+SIGNATURES: dict[str, list[tuple[tuple[int,int]|None, str, str]]] = {
+    # (milestone_range, hex_pattern_with_wildcards, arch)
+    # arch: "x86_64", "arm64", or "any"
     "create_server_socket": [
         # Chrome 120–149 x86_64 — derived from 149.0.7827.103
-        ((120, 149), "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 48 89 f3"),
+        ((120, 149), "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 48 89 f3", "x86_64"),
+        # Chrome 120–149 arm64 — STP x29,x30 prologue + unique pattern
+        ((120, 149), "fd 7b ?? a9 f4 ?? ?? a9 f6 ?? ?? a9 fd ?? ?? 91 f4 03 00 aa", "arm64"),
     ],
     "devtools_start": [
         # Chrome 120–149 x86_64
-        ((120, 149), "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 4c 89 e3"),
+        ((120, 149), "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 4c 89 e3", "x86_64"),
+        # Chrome 120–149 arm64 — DevToolsHttpHandler::Start prologue
+        ((120, 149), "fd 7b ?? a9 f4 ?? ?? a9 f6 ?? ?? a9 f8 ?? ?? a9 fd ?? ?? 91 f4 03 00 aa f5 03 01 aa", "arm64"),
     ],
     "handler_vtable_region": [
-        # vtable is found via RTTI name string "_ZTS" — handled by scanner
+        # vtable is found via RTTI name string — handled by scanner
     ],
 }
 
@@ -415,32 +421,33 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
     # Stored as None to signal "use dlsym" path
     found["op_new"] = None
 
-    # ── 4. Signature scan as fallback for create_server_socket ───────────────
-    print("[chroma/scan] signature scan for create_server_socket ...")
+    # ── 4. Signature scan (arch-filtered) ────────────────────────────────────
+    print(f"[chroma/scan] signature scan ({arch}) ...")
     text_va, text_sz, text_fo = macho["sections"].get("__TEXT,__text", (0, 0, 0))
     if text_sz:
         text_bytes = data[text_fo: text_fo + text_sz]
-        chrome_major = 0   # unknown at scan time
-        for name, (milestone_range, pat_hex) in [
-            (k, v) for k, entries in SIGNATURES.items() for v in entries
-        ]:
-            pat = bytes.fromhex(pat_hex.replace(" ", "").replace("??", "00"))
-            mask = bytes([0x00 if b == "??" else 0xFF
-                          for b in pat_hex.split()])
-            idx = 0
-            while idx < len(text_bytes) - len(pat):
-                match = all(
-                    (text_bytes[idx + j] & mask[j]) == (pat[j] & mask[j])
-                    for j in range(len(pat))
-                )
-                if match:
-                    fn_va = text_va + idx
-                    fn_rel = fn_va - vm_base
-                    print(f"[chroma/scan]   signature hit '{name}': 0x{fn_rel:x}")
-                    if name not in found or found[name] is None:
-                        found[name] = fn_rel
-                    break
-                idx += 4 if arch == "arm64" else 1
+        step = 4 if arch == "arm64" else 1
+
+        for sig_name, entries in SIGNATURES.items():
+            if sig_name in found and found[sig_name] is not None:
+                continue  # already found via xref
+            for (milestone_range, pat_hex, sig_arch) in entries:
+                if sig_arch != "any" and sig_arch != arch:
+                    continue  # skip signatures for wrong arch
+                pat_bytes  = pat_hex.split()
+                pat        = bytes(int(b, 16) if b != "??" else 0x00 for b in pat_bytes)
+                mask       = bytes(0x00 if b == "??" else 0xFF for b in pat_bytes)
+                pat_len    = len(pat)
+                idx = 0
+                while idx <= len(text_bytes) - pat_len:
+                    if all((text_bytes[idx + j] & mask[j]) == (pat[j] & mask[j])
+                           for j in range(pat_len)):
+                        fn_va  = text_va + idx
+                        fn_rel = fn_va - vm_base
+                        print(f"[chroma/scan]   sig hit '{sig_name}' ({arch}): rel=0x{fn_rel:x}")
+                        found[sig_name] = fn_rel
+                        break
+                    idx += step
 
     # ── 5. Vtable — scan for known RTTI name ─────────────────────────────────
     print("[chroma/scan] searching for TCPServerSocketFactory vtable ...")
@@ -481,7 +488,184 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
             if "handler_vtable" not in found:
                 found["handler_vtable"] = vtbl_rel
 
+    # ── 6. Frida runtime scan (best effort — finds xrefs in live process) ────
+    # If Frida is available and devtools_start is still missing, use it to scan
+    # the live process memory. Far more reliable than static analysis on arm64.
+    missing = [k for k in ("devtools_start", "handler_vtable") if not found.get(k)]
+    if missing:
+        print(f"[chroma/scan] static scan incomplete ({missing}), trying Frida live scan ...")
+        try:
+            frida_offsets = _frida_scan_offsets(arch)
+            for k in missing:
+                if frida_offsets.get(k):
+                    found[k] = frida_offsets[k]
+                    print(f"[chroma/scan]   frida found '{k}': rel=0x{frida_offsets[k]:x}")
+        except Exception as e:
+            print(f"[chroma/scan]   frida scan skipped: {e}")
+
     return found if any(v is not None for v in found.values()) else None
+
+
+def _frida_scan_offsets(arch: str) -> dict:
+    """
+    Use Frida to scan the live Chrome process for DevTools function addresses.
+    Searches for known strings in memory and backtracks to function prologues.
+    Returns offsets relative to the framework vm_base (ASLR-independent).
+    """
+    frida = _import_frida()
+    pid = get_chrome_pid()
+    session = frida.attach(pid)
+
+    result: dict = {}
+    import threading
+    done = threading.Event()
+
+    JS = r"""
+(function() {
+    var mod = Process.getModuleByName('Google Chrome Framework');
+    var base = mod.base;
+    var modSize = mod.size;
+    var results = {};
+
+    // Helper: walk backwards from an address to find a function prologue.
+    // arm64: look for STP x29,x30,[sp,...] (fd 7b ?? a9)
+    // x86_64: look for PUSH RBP; MOV RBP,RSP (55 48 89 e5)
+    function findPrologue(addr) {
+        var arch = Process.arch;
+        var step = (arch === 'arm64') ? 4 : 1;
+        var maxWalk = 512;
+        for (var i = step; i < maxWalk; i += step) {
+            var p = addr.sub(i);
+            try {
+                var b = p.readByteArray(4);
+                var v = new Uint8Array(b);
+                if (arch === 'arm64') {
+                    // STP x29, x30, [sp, #-N]! → FD 7B xx A9
+                    if (v[0] === 0xFD && v[1] === 0x7B && v[3] === 0xA9) {
+                        return p.sub(base);
+                    }
+                } else {
+                    // PUSH RBP (55) + MOV RBP,RSP (48 89 E5)
+                    if (v[0] === 0x55 && v[1] === 0x48 && v[2] === 0x89 && v[3] === 0xE5) {
+                        return p.sub(base);
+                    }
+                }
+            } catch(e) { break; }
+        }
+        return null;
+    }
+
+    // Search for "DevToolsActivePort" string in the module's __TEXT
+    var targets = [
+        { str: 'DevToolsActivePort', key: 'devtools_start' },
+        { str: 'Listening on ',      key: 'devtools_start' },
+    ];
+
+    for (var t = 0; t < targets.length; t++) {
+        if (results[targets[t].key]) continue;
+        try {
+            var matches = Memory.scanSync(base, modSize, targets[t].str
+                .split('').map(function(c) { return ('0'+c.charCodeAt(0).toString(16)).slice(-2); })
+                .join(' '));
+            for (var m = 0; m < matches.length; m++) {
+                // Find all references to this address within __TEXT
+                var strAddr = matches[m].address;
+                // Scan __TEXT for pointer or ADRP/LDR references to this addr
+                // Simplified: scan for the lower 32-bit page ref (ADRP) within 10MB
+                var pageTarget = strAddr.and(ptr('0xFFFFFFFFFFFFF000'));
+                var found = Memory.scanSync(base, Math.min(modSize, 10*1024*1024),
+                    pageTarget.toMatchPattern ? pageTarget.toMatchPattern() :
+                    pageTarget.toString(16).padStart(16,'0').match(/../g).reverse().join(' '));
+                // Fallback: just walk forward and find any instruction that loads near strAddr
+                // Use a simpler heuristic: look in the 2MB before the string for xrefs
+                var searchBase = strAddr.sub(2*1024*1024);
+                if (searchBase.compare(base) < 0) searchBase = base;
+                var searchSize = strAddr.sub(searchBase).toInt32();
+                if (searchSize < 4) continue;
+                // Scan for the page address encoded as an ADRP imm21
+                var strPage = strAddr.shr(12);
+                var scanBuf = searchBase.readByteArray(searchSize);
+                var arr = new Uint32Array(scanBuf);
+                for (var i = arr.length - 1; i >= 0; i--) {
+                    var instr = arr[i];
+                    // ADRP: bits[31:29]=100, bit[28]=1, bit[24]=0
+                    if ((instr & 0x9F000000) !== 0x90000000) continue;
+                    var immhi = (instr >> 5) & 0x7FFFF;
+                    var immlo = (instr >> 29) & 0x3;
+                    var imm = ((immhi << 2) | immlo) << 12;
+                    if (imm & 0x100000000) imm = imm - 0x200000000;
+                    var instrVA = searchBase.add(i * 4);
+                    var page = instrVA.and(ptr('0xFFFFFFFFFFFFF000')).add(imm);
+                    if (page.equals(pageTarget)) {
+                        var rel = findPrologue(instrVA);
+                        if (rel !== null && !results[targets[t].key]) {
+                            results[targets[t].key] = rel.toString();
+                        }
+                        break;
+                    }
+                }
+                if (results[targets[t].key]) break;
+            }
+        } catch(e) {}
+    }
+
+    // Vtable: find TCPServerSocketFactory RTTI string → typeinfo → vtable
+    var vtblCandidates = ['TCPServerSocketFactory', 'DevToolsHttpHandlerFactory'];
+    for (var v = 0; v < vtblCandidates.length && !results.handler_vtable; v++) {
+        try {
+            var ms = Memory.scanSync(base, modSize,
+                vtblCandidates[v].split('').map(function(c) {
+                    return ('0'+c.charCodeAt(0).toString(16)).slice(-2);
+                }).join(' '));
+            if (ms.length > 0) {
+                var nameAddr = ms[0].address;
+                // Search __DATA for a pointer to nameAddr
+                var dataSeg = null;
+                Process.enumerateRanges('r--').forEach(function(r) {
+                    if (!dataSeg && r.base.compare(base) > 0 &&
+                        r.base.compare(base.add(modSize)) < 0 &&
+                        r.size > 0x1000) {
+                        dataSeg = r;
+                    }
+                });
+                if (dataSeg) {
+                    var nameBytes = nameAddr.toString(16).padStart(16,'0')
+                        .match(/../g).reverse().join(' ');
+                    var ptrs = Memory.scanSync(dataSeg.base, dataSeg.size, nameBytes);
+                    if (ptrs.length > 0) {
+                        // vtable = found pointer + 16 bytes (skip RTTI header)
+                        var vtbl = ptrs[0].address.add(16);
+                        results.handler_vtable = vtbl.sub(base).toString();
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+
+    send(results);
+})();
+"""
+
+    def on_msg(msg, _):
+        if msg["type"] == "send":
+            result.update(msg["payload"])
+            done.set()
+
+    scr = session.create_script(JS)
+    scr.on("message", on_msg)
+    scr.load()
+    done.wait(timeout=15)
+    session.detach()
+
+    # Convert hex strings to relative ints
+    out = {}
+    for k, v in result.items():
+        if v:
+            try:
+                out[k] = int(v, 16)
+            except ValueError:
+                pass
+    return out
 
 
 # ── Offset resolution entry point ─────────────────────────────────────────
@@ -973,13 +1157,44 @@ def activate_lldb(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: st
     return False
 
 
-# ── Backend: Frida ─────────────────────────────────────────────────────────
-
-def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: str) -> bool:
+def _import_frida():
+    """
+    Import frida, trying Homebrew site-packages if the default import fails.
+    This handles `sudo python3` which may use /usr/bin/python3 instead of
+    the Homebrew python that has frida installed.
+    """
     try:
         import frida
+        return frida
     except ImportError:
-        raise RuntimeError("frida not installed — run: pip install frida")
+        pass
+
+    # Try known Homebrew paths (arm64 + x86_64 prefixes)
+    homebrew_roots = [
+        "/opt/homebrew/lib",           # arm64 (Apple Silicon)
+        "/usr/local/lib",              # x86_64 (Intel)
+    ]
+    import importlib, importlib.util, glob as _glob, sys as _sys
+
+    for root in homebrew_roots:
+        for sp in _glob.glob(f"{root}/python3*/site-packages"):
+            if sp not in _sys.path:
+                _sys.path.insert(0, sp)
+            try:
+                import frida
+                return frida
+            except ImportError:
+                continue
+
+    raise RuntimeError(
+        "frida not importable — run: pip install frida\n"
+        "If using sudo, ensure frida is installed for the system python:\n"
+        "  sudo /opt/homebrew/bin/pip3 install frida"
+    )
+
+
+def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: str) -> bool:
+    frida = _import_frida()
 
     session  = frida.attach(pid)
     result   = {}
