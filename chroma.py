@@ -511,6 +511,110 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
         found["devtools_start"] = best[0]
         print(f"[chroma/scan]   → devtools_start selected: 0x{best[0]:x} (size~0x{best[1]:x}{'  ✓ confirmed by Listening-on xref' if best[0] in listening_fns else ''})")
 
+    # ── 2b. ARM64 only: find the outer wrapper (DevToolsManager::MaybeCreateForBrowserContext)
+    # "DevToolsActivePort" and "Listening on" are inside DevToolsHttpHandler::Start (the
+    # *inner* function, sub_2F93AAC-equivalent).  The callable entry point from outside is
+    # the *outer* wrapper that calls GetBrowserContext() + builds the factory + calls Start.
+    # It is identified by "remote-debugging-port" string xref → small setup function →
+    # extracts the BL target just after the 0x2475 flags write.
+    #
+    # Layout in the outer setup function (arm64 Chrome 149):
+    #   opnew(0x10) → fc
+    #   ADRL  X8, <vtable_CF99820>
+    #   STR   X8, [fc]              ; [fc+0] = vtable
+    #   STRH  W25, [fc, #8]         ; [fc+8] = port (uint16)
+    #   MOV   W8, #0x2475
+    #   STRH  W8, [fc, #0xA]        ; [fc+A] = flags
+    #   ADD/SUB X1, ...             ; socket_name string
+    #   ADD/SUB X2, ...             ; frontend string (custom-devtools-frontend)
+    #   MOV   W3, #0
+    #   BL    sub_OUTER_WRAPPER     ← THIS is the callable we want
+    #
+    # We scan for "remote-debugging-port" → walk to prologue of containing function →
+    # then scan forward for the 0x2475 immediate → then find the next BL = outer wrapper.
+    # The vtable is the ADRL target just before the port write.
+    if arch == "arm64":
+        print("[chroma/scan] arm64: searching for outer DevTools wrapper via 'remote-debugging-port' ...")
+        rdp_fos = _find_string_fileoffs(data, b"remote-debugging-port")
+        for rdp_fo in rdp_fos:
+            refs = _arm64_adrp_refs(data, macho, rdp_fo)
+            for ref_fo in refs:
+                setup_prologue_fo = _walk_to_prologue(data, ref_fo)
+                if setup_prologue_fo is None:
+                    continue
+                setup_hit = _fo_to_fn_rel(setup_prologue_fo)
+                if not setup_hit:
+                    continue
+                setup_fn_rel, setup_fn_size = setup_hit
+                print(f"[chroma/scan]   remote-debugging-port: setup fn at 0x{setup_fn_rel:x}")
+
+                # Scan up to 0x400 bytes past the string xref for:
+                #   MOV W8, #0x2475  (arm64: 0xD2848E88 or similar Wn variant)
+                # Then find the next BL (0x94xxxxxx encoding) = outer wrapper.
+                # Also capture the preceding ADRP+ADD target = vtable.
+                scan_start = ref_fo
+                scan_end   = min(scan_start + 0x400, setup_prologue_fo + setup_fn_size)
+                vtable_candidate = None
+                for fo in range(scan_start, scan_end, 4):
+                    if fo + 4 > len(data):
+                        break
+                    import struct as _struct
+                    instr = _struct.unpack_from("<I", data, fo)[0]
+                    # MOV Wn, #0x2475 → encoding: MOVZ Wn, #0x2475 = 0xD284_8E8n
+                    # General: (instr >> 23) == 0x1A5 and ((instr >> 5) & 0xFFFF) == 0x2475
+                    if (instr >> 23) == 0x1A5 and ((instr >> 5) & 0xFFFF) == 0x2475:
+                        # Found the 0x2475 flags write — scan forward for next BL
+                        for bl_fo in range(fo + 4, min(fo + 0x40, scan_end), 4):
+                            if bl_fo + 4 > len(data):
+                                break
+                            bl_instr = _struct.unpack_from("<I", data, bl_fo)[0]
+                            if (bl_instr >> 26) == 0x25:   # BL opcode
+                                # Decode BL offset
+                                imm26 = bl_instr & 0x3FFFFFF
+                                if imm26 & (1 << 25):
+                                    imm26 -= (1 << 26)
+                                text_va, text_sz, text_fo_sec = macho["sections"].get("__TEXT,__text", (0, 0, 0))
+                                bl_va = text_va + (bl_fo - text_fo_sec)
+                                target_va = bl_va + imm26 * 4
+                                target_rel = target_va - vm_base
+                                print(f"[chroma/scan]   → arm64 outer wrapper (via 0x2475+BL): 0x{target_rel:x}")
+                                found["devtools_start"] = target_rel
+                                break
+
+                        # Also find vtable: scan backwards from the 0x2475 instr for ADRP+ADD
+                        # targeting __DATA_CONST,__const
+                        dc_va, dc_sz, dc_fo_s = macho["sections"].get(
+                            "__DATA_CONST,__const", macho["sections"].get("__DATA,__const", (0, 0, 0))
+                        )
+                        if dc_sz and "handler_vtable" not in found:
+                            text_va, text_sz, text_fo_sec = macho["sections"].get("__TEXT,__text", (0, 0, 0))
+                            for vt_fo in range(fo - 4, max(fo - 0x80, scan_start) - 4, -4):
+                                if vt_fo < 0 or vt_fo + 8 > len(data):
+                                    continue
+                                vt_instr = _struct.unpack_from("<I", data, vt_fo)[0]
+                                if (vt_instr & 0x9F000000) == 0x90000000:
+                                    immhi = (vt_instr >> 5) & 0x7FFFF
+                                    immlo = (vt_instr >> 29) & 0x3
+                                    imm = ((immhi << 2) | immlo) << 12
+                                    if imm & (1 << 32):
+                                        imm -= (1 << 33)
+                                    instr_va = text_va + (vt_fo - text_fo_sec)
+                                    page_va = (instr_va & ~0xFFF) + imm
+                                    next_w = _struct.unpack_from("<I", data, vt_fo + 4)[0]
+                                    if (next_w & 0xFF800000) == 0x91000000:
+                                        add_imm = (next_w >> 10) & 0xFFF
+                                        target_vtbl = page_va + add_imm
+                                        if dc_va <= target_vtbl < dc_va + dc_sz:
+                                            vtbl_rel = target_vtbl - vm_base
+                                            print(f"[chroma/scan]   → arm64 factory vtable (via 0x2475 scan): 0x{vtbl_rel:x}")
+                                            found["handler_vtable"] = vtbl_rel
+                                            break
+                        break  # found 0x2475, done with this xref
+                if found.get("devtools_start") and found.get("handler_vtable"):
+                    break
+            if found.get("devtools_start") and found.get("handler_vtable"):
+                break
+
     # ── 3. operator new — always resolved via libc++ export (no offset) ───────
     # Stored as None to signal "use dlsym" path
     found["op_new"] = None
@@ -797,11 +901,106 @@ def _frida_scan_offsets(arch: str) -> dict:
         return null;
     }
 
-    // ── DevTools start: try multiple stable strings ───────────────────────
-    var devtoolsStrings = ['DevToolsActivePort', 'Listening on '];
-    for (var di = 0; di < devtoolsStrings.length && !results.devtools_start; di++) {
-        var r = findFnForString(devtoolsStrings[di], 'devtools_start[' + devtoolsStrings[di] + ']');
-        if (r) results.devtools_start = r;
+    // ── DevTools start ────────────────────────────────────────────────────
+    // arm64: the callable entry point is NOT DevToolsHttpHandler::Start (which holds
+    // "DevToolsActivePort"/"Listening on" strings) but the *outer wrapper* that calls
+    // GetBrowserContext() + builds the factory + calls Start.
+    // We find it via "remote-debugging-port" → setup function → scan for MOV Wn, #0x2475
+    // → next BL = outer wrapper.  The ADRP+ADD just before the 0x2475 write = factory vtable.
+    //
+    // x86_64: "DevToolsActivePort"/"Listening on" strings are fine (inner Start is directly
+    // called with the same factory layout).
+    var isArm64 = (Process.arch === 'arm64');
+    if (isArm64) {
+        try {
+            var rdpMatches = Memory.scanSync(base, mod.size, strPattern('remote-debugging-port'));
+            for (var rmi = 0; rmi < rdpMatches.length && !results.devtools_start; rmi++) {
+                var rdpAddr = rdpMatches[rmi].address;
+                // Find the function that references this string
+                var setupFn = null;
+                var scanSize4 = Math.min(4 * 1024 * 1024, rdpAddr.sub(base).toInt32());
+                if (scanSize4 < 4) continue;
+                var buf4 = rdpAddr.sub(scanSize4).readByteArray(scanSize4);
+                var arr4 = new Uint32Array(buf4);
+                for (var si4 = arr4.length - 1; si4 >= 0 && !setupFn; si4--) {
+                    var iptr4 = rdpAddr.sub(scanSize4 - si4 * 4);
+                    var pg4 = decodeAdrp(iptr4);
+                    var rdpPage = ptr(Number(BigInt('0x' + rdpAddr.toString(16)) & BigInt('0xFFFFFFFFFFFFF000')).toString());
+                    if (pg4 !== null && pg4.equals(rdpPage)) {
+                        setupFn = findPrologue(iptr4);
+                    }
+                    if (!setupFn) {
+                        var lv = decodeLdrLiteral(iptr4);
+                        if (lv !== null && lv.equals(rdpAddr)) {
+                            setupFn = findPrologue(iptr4);
+                        }
+                    }
+                }
+                if (!setupFn) continue;
+                errs.push('devtools_start: setup fn at ' + setupFn.sub(base).toString(16));
+
+                // Scan forward from rdpAddr up to 0x400 bytes for MOV Wn, #0x2475
+                var scanFwd = 0x400;
+                var fwdBuf = rdpAddr.readByteArray(scanFwd);
+                var fwdArr = new Uint32Array(fwdBuf);
+                for (var fi = 0; fi < fwdArr.length && !results.devtools_start; fi++) {
+                    var finstr = fwdArr[fi];
+                    // MOVZ Wn, #0x2475: (instr >> 23) == 0x1A5 && ((instr >> 5) & 0xFFFF) == 0x2475
+                    if ((finstr >>> 23) === 0x1A5 && ((finstr >>> 5) & 0xFFFF) === 0x2475) {
+                        errs.push('devtools_start: found 0x2475 at offset ' + (fi * 4));
+                        // Scan forward for next BL (0x94xxxxxx)
+                        for (var bli = fi + 1; bli < Math.min(fi + 16, fwdArr.length); bli++) {
+                            var blinstr = fwdArr[bli];
+                            if ((blinstr >>> 26) === 0x25) {
+                                var imm26 = blinstr & 0x3FFFFFF;
+                                if (imm26 & (1 << 25)) imm26 = imm26 - (1 << 26);
+                                var blPtr = rdpAddr.add(bli * 4);
+                                var targetPtr = blPtr.add(imm26 * 4);
+                                results.devtools_start = targetPtr.sub(base).toString(16);
+                                errs.push('devtools_start: outer wrapper at ' + results.devtools_start);
+                                break;
+                            }
+                        }
+                        // Scan backwards for ADRP+ADD targeting __DATA_CONST = factory vtable
+                        if (!results.handler_vtable) {
+                            for (var vti = fi - 1; vti >= Math.max(0, fi - 32); vti--) {
+                                var vtinstr = fwdArr[vti];
+                                if ((vtinstr & 0x9F000000) === 0x90000000) {
+                                    var vtImmhi = Number((BigInt(vtinstr) >> BigInt(5)) & BigInt('0x7FFFF'));
+                                    var vtImmlo = Number((BigInt(vtinstr) >> BigInt(29)) & BigInt(3));
+                                    var vtImm21 = (vtImmhi << 2) | vtImmlo;
+                                    if (vtImm21 & (1 << 20)) vtImm21 = vtImm21 - (1 << 21);
+                                    var vtPageOff = vtImm21 * 4096;
+                                    var vtInstrAddr = rdpAddr.add(vti * 4);
+                                    var vtPage = ptr(Number((BigInt('0x' + vtInstrAddr.toString(16)) & BigInt('0xFFFFFFFFFFFFF000')) + BigInt(vtPageOff)).toString());
+                                    if (vti + 1 < fwdArr.length) {
+                                        var addw = fwdArr[vti + 1];
+                                        if ((addw & 0xFF800000) === 0x91000000) {
+                                            var addImm = (addw >> 10) & 0xFFF;
+                                            var vtblPtr = vtPage.add(addImm);
+                                            results.handler_vtable = vtblPtr.sub(base).toString(16);
+                                            errs.push('handler_vtable: found via 0x2475 backward scan: ' + results.handler_vtable);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch(e) {
+            errs.push('devtools_start[arm64/remote-debugging-port]: ' + e.message);
+        }
+    }
+    // x86_64 (or arm64 fallback): scan via stable strings inside DevToolsHttpHandler::Start
+    if (!results.devtools_start) {
+        var devtoolsStrings = ['DevToolsActivePort', 'Listening on '];
+        for (var di = 0; di < devtoolsStrings.length && !results.devtools_start; di++) {
+            var r = findFnForString(devtoolsStrings[di], 'devtools_start[' + devtoolsStrings[di] + ']');
+            if (r) results.devtools_start = r;
+        }
     }
 
     // ── Vtable: RTTI name → typeinfo ptr → vtable ─────────────────────────
@@ -1111,8 +1310,9 @@ static void _chroma_activate(void) {{
 
     void* sb = opnew(0x20); memset(sb, 0, 0x20);
     void* ab = opnew(0x50); memset(ab, 0, 0x50);
-    void* fc = opnew(0x20); memset(fc, 0, 0x20);
+    void* fc = opnew({0x10 if arch == 'arm64' else 0x20}); memset(fc, 0, {0x10 if arch == 'arm64' else 0x20});
 {vtable_line}
+    // port at [+8] (uint16), flags at [+A] (uint16) — same offset for both arches
     ((uint16_t*)fc)[4] = (uint16_t){port};
     ((uint16_t*)fc)[5] = (uint16_t)0x2475;
 
