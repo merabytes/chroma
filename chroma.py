@@ -270,8 +270,16 @@ def _x86_64_rip_refs(data: bytes, macho: dict, target_fileoff: int) -> list[int]
 
 def _arm64_adrp_refs(data: bytes, macho: dict, target_fileoff: int) -> list[int]:
     """
-    Scan __TEXT,__text for ADRP+ADD pairs referencing target_fileoff.
-    Returns list of ADRP instruction file offsets.
+    Scan __TEXT,__text for instructions that reference target_fileoff.
+
+    Handles two arm64 addressing patterns:
+      1. ADRP + ADD   — ADRP targets same 4K page as string, ADD gives page offset.
+                        Used when string is addressed page-relatively.
+      2. LDR Xn, [PC, #imm]  — literal pool load; pool entry holds the on-disk vmaddr
+                                of the string.  Chrome 149 arm64 often uses this for
+                                strings that are close enough for a PC-relative literal.
+
+    Returns list of instruction file offsets (the ADRP or LDR instruction).
     """
     text_va, text_sz, text_fo = macho["sections"].get("__TEXT,__text", (0, 0, 0))
     if not text_sz:
@@ -287,33 +295,42 @@ def _arm64_adrp_refs(data: bytes, macho: dict, target_fileoff: int) -> list[int]
 
     results = []
     text = data[text_fo: text_fo + text_sz]
-    target_page = target_va & ~0xFFF
+    target_page  = target_va & ~0xFFF
     target_pgoff = target_va & 0xFFF
+
+    # Pack target vmaddr for literal pool search (8-byte LE)
+    target_va_bytes = struct.pack("<Q", target_va)
 
     for i in range(0, len(text) - 8, 4):
         instr = struct.unpack_from("<I", text, i)[0]
-        # ADRP: bits[31:24]=1??10000, bit[28]=1
-        if (instr & 0x9F000000) != 0x90000000:
+
+        # ── Pattern 1: ADRP + ADD ──────────────────────────────────────────
+        if (instr & 0x9F000000) == 0x90000000:
+            immhi    = (instr >> 5) & 0x7FFFF
+            immlo    = (instr >> 29) & 0x3
+            imm      = ((immhi << 2) | immlo) << 12
+            if imm & (1 << 32):
+                imm -= (1 << 33)
+            instr_va = text_va + i
+            page_va  = (instr_va & ~0xFFF) + imm
+            if page_va == target_page:
+                add = struct.unpack_from("<I", text, i + 4)[0]
+                if (add & 0xFF800000) == 0x91000000:
+                    add_imm = (add >> 10) & 0xFFF
+                    if add_imm == target_pgoff:
+                        results.append(text_fo + i)
             continue
-        # Decode ADRP
-        immhi = (instr >> 5) & 0x7FFFF
-        immlo = (instr >> 29) & 0x3
-        imm   = ((immhi << 2) | immlo) << 12
-        if imm & (1 << 32):
-            imm -= (1 << 33)
-        instr_va = text_va + i
-        page_va  = (instr_va & ~0xFFF) + imm
-        if page_va != target_page:
-            continue
-        # Check following ADD
-        if i + 4 >= len(text):
-            continue
-        add = struct.unpack_from("<I", text, i + 4)[0]
-        if (add & 0xFF800000) != 0x91000000:
-            continue
-        add_imm = (add >> 10) & 0xFFF
-        if add_imm == target_pgoff:
-            results.append(text_fo + i)
+
+        # ── Pattern 2: LDR Xn, [PC, #imm] (literal pool) ──────────────────
+        # Encoding: bits[31:24] = 0x58 (64-bit variant)
+        if (instr & 0xFF000000) == 0x58000000:
+            imm19 = (instr >> 5) & 0x7FFFF
+            if imm19 & (1 << 18):
+                imm19 -= (1 << 19)
+            pool_fo = text_fo + i + imm19 * 4  # file offset of the pool slot
+            if 0 <= pool_fo <= len(data) - 8:
+                if data[pool_fo: pool_fo + 8] == target_va_bytes:
+                    results.append(text_fo + i)
 
     return results
 
@@ -591,6 +608,28 @@ def _frida_scan_offsets(arch: str) -> dict:
         return ptr(targetPage.toString());
     }
 
+    // ── Helper: decode arm64 LDR Xn, [PC, #imm] literal pool load.
+    // Returns the NativePointer value stored in the literal pool slot,
+    // or null if this is not a 64-bit LDR-literal instruction.
+    function decodeLdrLiteral(instrPtr) {
+        var b = instrPtr.readByteArray(4);
+        var v = new Uint8Array(b);
+        var instr = v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24);
+        // 64-bit LDR literal: bits[31:24] == 0x58
+        if ((instr & 0xFF000000) !== 0x58000000) return null;
+        var imm19 = (instr >> 5) & 0x7FFFF;
+        // Sign extend 19-bit
+        if (imm19 & (1 << 18)) imm19 = imm19 - (1 << 19);
+        // Pool slot address = PC + imm19 * 4
+        var instrAddrBig = BigInt('0x' + instrPtr.toString(16));
+        var poolAddr = ptr((instrAddrBig + BigInt(imm19 * 4)).toString());
+        try {
+            return poolAddr.readPointer();  // 8-byte pointer stored in pool
+        } catch(e) {
+            return null;
+        }
+    }
+
     // ── Scan for a string and find the function that references it ────────
     function findFnForString(needle, label) {
         try {
@@ -603,8 +642,8 @@ def _frida_scan_offsets(arch: str) -> dict:
                 var strAddr = matches[mi].address;
                 var strPage = ptr((Number(BigInt('0x' + strAddr.toString(16)) & BigInt('0xFFFFFFFFFFFFF000'))).toString());
 
-                // Scan the 4MB of code before the string for ADRP instructions
-                // that target the same 4K page as strAddr
+                // Scan the 4MB of code before the string for ADRP or LDR-literal
+                // instructions that reference strAddr (or its page)
                 var scanStart = strAddr.sub(4 * 1024 * 1024);
                 if (scanStart.compare(base) < 0) scanStart = base;
                 var scanSize  = strAddr.sub(scanStart).toInt32();
@@ -615,18 +654,30 @@ def _frida_scan_offsets(arch: str) -> dict:
                 // Walk backwards from the string (most likely callers are just before it)
                 for (var i = arr.length - 1; i >= 0; i--) {
                     var instrPtr = scanStart.add(i * 4);
+
+                    // ── Path A: ADRP + ADD (page-relative) ────────────────
                     var page = decodeAdrp(instrPtr);
-                    if (page === null) continue;
-                    if (page.equals(strPage)) {
+                    if (page !== null && page.equals(strPage)) {
                         var prologue = findPrologue(instrPtr);
                         if (prologue) {
-                            errs.push(label + ': found at ' + prologue.toString(16) +
+                            errs.push(label + ': found (ADRP) at ' + prologue.toString(16) +
+                                      ' (xref from ' + instrPtr.sub(base).toString(16) + ')');
+                            return prologue.sub(base).toString(16);
+                        }
+                    }
+
+                    // ── Path B: LDR Xn, [PC, #imm] (literal pool) ─────────
+                    var poolVal = decodeLdrLiteral(instrPtr);
+                    if (poolVal !== null && poolVal.equals(strAddr)) {
+                        var prologue = findPrologue(instrPtr);
+                        if (prologue) {
+                            errs.push(label + ': found (LDR-literal) at ' + prologue.toString(16) +
                                       ' (xref from ' + instrPtr.sub(base).toString(16) + ')');
                             return prologue.sub(base).toString(16);
                         }
                     }
                 }
-                errs.push(label + ': ADRP xref not found in 4MB window before string');
+                errs.push(label + ': no ADRP/LDR-literal xref found in 4MB window before string');
             }
         } catch(e) {
             errs.push(label + ': exception: ' + e.message + '\n' + e.stack);
