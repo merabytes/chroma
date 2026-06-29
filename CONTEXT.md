@@ -14,7 +14,7 @@ Local: `~/chroma/chroma.py`
 ```
 chroma.py
 ├── Offset discovery (per Chrome version+arch, cached in ~/.chroma/offsets.json)
-│   1. Cache hit (key = "149.0.7827.104-arm64")
+│   1. Cache hit (key = "149.0.7827.116-arm64")
 │   2. Static scan: ADRP xref scanner + signature scan (arch-filtered)
 │   3. Frida live scan: _frida_scan_offsets() — scans running process memory
 │   4. Manual: --offset key=0xVALUE
@@ -30,94 +30,75 @@ chroma.py
 
 ---
 
-## Target offsets needed (relative to framework vm_base, ASLR-independent)
+## Target offsets (Chrome 149.0.7827.116 arm64)
 
-| Key | Description | Status x86_64 | Status arm64 |
-|-----|-------------|---------------|--------------|
-| `devtools_start` | `DevToolsHttpHandler::Start(factory*, socket*, addr*, flags)` | ✅ found via sig | ❌ not found yet |
-| `handler_vtable` | vtable ptr for `TCPServerSocketFactory` | ✅ found via RTTI | ❌ not found yet |
-| `create_server_socket` | optional — creates TCP socket | ✅ | ⚠️ false positive (0x7690 is wrong) |
-| `op_new` | `operator new` — always from libc++ `_Znwm`, never a Chrome offset | ✅ | ✅ |
-
-**`op_new` is always resolved at runtime via `dlsym(RTLD_DEFAULT, "_Znwm")` — no offset needed.**
+| Key | IDA address | Description | Status |
+|-----|------------|-------------|--------|
+| `devtools_start` | `sub_2ED62AC` | outer wrapper: GetBrowserContext + factory + Start | ✅ fixed in fec210d |
+| `handler_vtable` | `unk_CF99820` | vtable for TCPServerSocketFactory (0x10 byte factory) | ✅ fixed in fec210d |
+| `create_server_socket` | — | optional, not needed | skip |
+| `op_new` | — | always from libc++ `_Znwm` via dlsym | ✅ |
 
 ---
 
-## ARM64 specific problems & current state
+## ARM64 root cause (solved in fec210d)
 
-### 1. vm_base = 0x0
-The arm64 slice of the framework has `__TEXT vmaddr = 0x0` (PIE/position-independent).  
-All offsets are relative to 0x0, so `rel = fn_va - 0 = fn_va`. This is correct behavior — the slide is the full runtime base address.
+### The crash
+`EXC_ARM_DA_ALIGN` / PAC auth failure at `0x84aed33800000001` in Thread 41 (injected dylib).
 
-### 2. Static ADRP scanner not finding devtools_start
-Chrome arm64 uses `ADRP + LDR` (load from GOT) rather than `ADRP + ADD` for string references. The static scanner's `_arm64_adrp_refs()` function walks backwards from string file-offsets and looks for ADRP instructions, but:
-- The 4K page alignment math had 32-bit overflow bugs (now fixed with file-offset arithmetic)
-- `DevToolsActivePort` and `Listening on ` may be in `__TEXT,__cstring` but referenced from a far section
+### Root cause
+The scanner found `sub_2F93AAC` (= `DevToolsHttpHandler::Start`, the **inner** function) via
+`DevToolsActivePort`/`Listening on` xrefs. The dylib passed the factory object as `X0=this` to
+this function. Chrome immediately dereferenced it as a DevToolsHttpHandler vtable → PAC failure.
 
-### 3. Frida live scanner
-`_frida_scan_offsets()` is the most reliable path for arm64. It:
-- Finds the string in live memory via `Memory.scanSync()`
-- Scans 4MB of code before the string for ADRP instructions (BigInt arithmetic to avoid 32-bit overflow)
-- Walks backwards to find function prologue: `STP x29,x30,[sp,#-N]!` (FD 7B ?? A9) or PACIBSP/PACIASP
-- Returns offsets as hex strings relative to module base
-
-**Current bug being debugged**: Frida scanner runs but `devtools_start` still not found. The diagnostic output (`[chroma/frida-scan] diagnostics:`) was added in commit `58c0943` — output not yet seen from user.
-
-### 4. Signature database (arm64)
-Stored in `SIGNATURES` dict with `(milestone_range, hex_pattern, arch)` tuples.  
-Current arm64 entries are **placeholders** — need real bytes from the binary:
-```python
-# These need to be verified/replaced with actual bytes from Chrome 149 arm64:
-((120, 149), "fd 7b ?? a9 f4 ?? ?? a9 f6 ?? ?? a9 fd ?? ?? 91 f4 03 00 aa", "arm64"),  # create_server_socket
-((120, 149), "fd 7b ?? a9 f4 ?? ?? a9 f6 ?? ?? a9 f8 ?? ?? a9 fd ?? ?? 91 f4 03 00 aa f5 03 01 aa", "arm64"),  # devtools_start
+### Correct call chain (arm64)
+```
+sub_2ED5E58   ("remote-debugging-port" setup function)
+  │  opnew(0x10) → fc
+  │  ADRL X8, unk_CF99820  ; factory vtable
+  │  STR  X8, [fc]
+  │  STRH port, [fc,#8]
+  │  MOV  W8, #0x2475
+  │  STRH W8, [fc,#0xA]
+  │  BL   sub_2ED62AC      ← THIS is devtools_start (outer wrapper)
+  │
+  └─▶ sub_2ED62AC(factory*, socket_name*, frontend*, flags=0)
+        BL sub_1CA2970     ; GetBrowserContext()
+        opnew(0x88)        ; alloc DevToolsHttpHandler
+        BL sub_2ED641C(handler, browser_ctx, factory, sock, frontend, flags)
+          └─▶ sub_2F93AAC  ; inner Start (the one we were calling wrong)
 ```
 
----
+### Fix
+- Static scanner (arm64, step 2b): scan `remote-debugging-port` → setup fn → find `MOV Wn,#0x2475`
+  → next `BL` = outer wrapper. ADRP+ADD before `0x2475` = factory vtable.
+- Frida JS scanner: same logic in the JS block.
+- Dylib template: factory size `0x10` for arm64 (not `0x20`).
 
-## How to derive the correct arm64 offsets manually
-
-### Option A — otool + strings (offline)
-```bash
-FW="/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/149.0.7827.104/Google Chrome Framework"
-
-# Find DevToolsActivePort string offset
-otool -arch arm64 -s __TEXT __cstring "$FW" | grep -b "DevToolsActivePort"
-
-# Disassemble around a candidate function
-otool -arch arm64 -tV "$FW" | grep -A 40 "DevToolsActivePort"
+### Factory layout (arm64, 0x10 bytes)
+```
+[+0x00]  vtable ptr   (unk_CF99820, relative to slide)
+[+0x08]  port uint16
+[+0x0A]  flags 0x2475
+[+0x0C]  padding
 ```
 
-### Option B — lldb offline (no inject, just inspect)
-```bash
-lldb "$FW"
-(lldb) image dump symtab  # if symbols exist (they don't in stripped builds)
-(lldb) memory find -s "DevToolsActivePort" -- 0x100000000 0x200000000
-```
-
-### Option C — Frida on running Chrome (best)
-```bash
-sudo frida -p $(pgrep -x "Google Chrome") -e "
-var mod = Process.getModuleByName('Google Chrome Framework');
-var m = Memory.scanSync(mod.base, mod.size, '44 65 76 54 6f 6f 6c 73 41 63 74 69 76 65 50 6f 72 74');
-m.forEach(function(x) { console.log('string at:', x.address, 'offset:', x.address.sub(mod.base)); });
-"
-# Then find ADRP xrefs to that address manually
-```
-
-### Option D — Supply manually
-```bash
-sudo python3 chroma.py \
-  --offset devtools_start=0xXXXXXXX \
-  --offset handler_vtable=0xYYYYYYY
+### dylib call (unchanged semantics)
+```c
+dstart(fc, sb, ab, 0);
+// fc = factory (0x10 bytes, vtable+port+0x2475)
+// sb = socket_name (0x20 bytes, zeroed = use default)
+// ab = frontend   (0x50 bytes, zeroed = use default)
+// 0  = flags
 ```
 
 ---
 
 ## Key constants / invariants
 
-- **Chrome 149.0.7827.104 arm64** — PID typically 643 (changes on restart)
-- **Framework path**: `/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/149.0.7827.104/Google Chrome Framework`
-- **Cache file**: `~/.chroma/offsets.json` — delete to force rescan
+- **Chrome 149.0.7827.116 arm64** — current crashing version (was .104 in old cache)
+- **Framework path**: `/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/149.0.7827.116/Google Chrome Framework`
+- **Cache file**: `~/.chroma/offsets.json` — owned by root (sudo chroma), key `149.0.7827.116-arm64` not cached yet → will trigger rescan on first run
 - **Frida installed**: `/opt/homebrew/lib/python3.11/site-packages/frida` (Homebrew)
 - **`sudo python3`** uses system Python; `_import_frida()` adds Homebrew site-packages to `sys.path` automatically
 - **CDP target port**: 9222 (default)
@@ -125,22 +106,14 @@ sudo python3 chroma.py \
 
 ---
 
-## Activation flow (what happens when offsets are found)
+## How to run
 
-```c
-// Compiled into a .dylib, injected via dlopen() from a Mach thread:
-void* opnew  = _Znwm;                          // from libc++
-void* dstart = base + offsets["devtools_start"]; // ASLR-adjusted
-
-void* sb = opnew(0x20); memset(sb, 0, 0x20);   // socket name buffer
-void* ab = opnew(0x50); memset(ab, 0, 0x50);   // addr buffer
-void* fc = opnew(0x20); memset(fc, 0, 0x20);   // factory object
-*(void**)fc        = base + offsets["handler_vtable"];
-((uint16_t*)fc)[4] = 9222;    // port
-((uint16_t*)fc)[5] = 0x2475;  // flags
-
-// create_server_socket is optional — skip if offset unknown
-dstart(fc, sb, ab, 0);         // DevToolsHttpHandler::Start
+```bash
+sudo python3 ~/chroma/chroma.py
+# Or with explicit scan to see diagnostics:
+sudo python3 ~/chroma/chroma.py --scan
+# Or manual override if scanner fails:
+sudo python3 ~/chroma/chroma.py --offset devtools_start=0x2ED62AC --offset handler_vtable=0xCF99820
 ```
 
 ---
@@ -149,7 +122,8 @@ dstart(fc, sb, ab, 0);         // DevToolsHttpHandler::Start
 
 | Hash | Description |
 |------|-------------|
-| `58c0943` | fix(frida-scan): BigInt ADRP decode, proper error logging, NativePointer arithmetic |
+| `fec210d` | **fix(arm64): correct devtools_start to outer wrapper via remote-debugging-port+0x2475 scan** |
+| `19b7ae8` | fix(frida-scan): BigInt ADRP decode, proper error logging, NativePointer arithmetic |
 | `798a269` | fix: JS toString(16) for hex offsets; auto-invalidate incomplete cache |
 | `c7ac754` | fix(arm64): arch-filtered sigs, sudo frida path resolution, Frida live xref scanner |
 | `23c4906` | fix: fat binary magic detection — fat header is BE, Mach-O slice is LE |
@@ -160,18 +134,13 @@ dstart(fc, sb, ab, 0);         // DevToolsHttpHandler::Start
 
 ## Immediate next step
 
-Run `sudo python3 chroma.py --scan` and capture the full output.  
-The Frida scanner now prints diagnostics — the key line to look for:
+Run `sudo python3 chroma.py --scan` and verify:
 
 ```
-[chroma/frida-scan] diagnostics:
-  devtools_start[DevToolsActivePort]: string not found in memory   ← means string IS in memory but ADRP xref not found
-  devtools_start[DevToolsActivePort]: ADRP xref not found in 4MB window before string  ← window too small or wrong section
-  devtools_start[DevToolsActivePort]: found at 0xXXXXXX (xref from 0xYYYYYY)  ← SUCCESS
+[chroma/scan] arm64: searching for outer DevTools wrapper via 'remote-debugging-port' ...
+[chroma/scan]   remote-debugging-port: setup fn at 0x2ed5e58
+[chroma/scan]   → arm64 factory vtable (via 0x2475 scan): 0xcf99820
+[chroma/scan]   → arm64 outer wrapper (via 0x2475+BL): 0x2ed62ac
 ```
 
-**FIXED in `a166b36`**: both static `_arm64_adrp_refs()` and Frida `findFnForString()` now handle two patterns:
-- `ADRP + ADD` (page-relative, original path)
-- `LDR Xn, [PC, #imm]` (literal pool, `0x58xxxxxx` encoding) — Chrome 149 arm64 uses this for strings close to the referencing code
-
-Run `sudo python3 chroma.py --scan` to get fresh diagnostics with the new scanner.
+Then verify CDP is alive: `curl http://localhost:9222/json/version`
