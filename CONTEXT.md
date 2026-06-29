@@ -170,4 +170,8 @@ The Frida scanner now prints diagnostics — the key line to look for:
   devtools_start[DevToolsActivePort]: found at 0xXXXXXX (xref from 0xYYYYYY)  ← SUCCESS
 ```
 
-If the string is found but no ADRP xref: the reference may be a **LDR from literal pool** (arm64 alternative to ADRP+ADD for nearby constants). The fix would be to also scan for `LDR Xn, [PC, #imm]` (encoding: `xx xx xx 58`).
+**FIXED in `a166b36`**: both static `_arm64_adrp_refs()` and Frida `findFnForString()` now handle two patterns:
+- `ADRP + ADD` (page-relative, original path)
+- `LDR Xn, [PC, #imm]` (literal pool, `0x58xxxxxx` encoding) — Chrome 149 arm64 uses this for strings close to the referencing code
+
+Run `sudo python3 chroma.py --scan` to get fresh diagnostics with the new scanner.
