@@ -548,12 +548,14 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
                 setup_fn_rel, setup_fn_size = setup_hit
                 print(f"[chroma/scan]   remote-debugging-port: setup fn at 0x{setup_fn_rel:x}")
 
-                # Scan up to 0x400 bytes past the string xref for:
+                # Scan the ENTIRE setup function body for:
                 #   MOV W8, #0x2475  (arm64: 0xD2848E88 or similar Wn variant)
+                # NOTE: the 0x2475 write happens BEFORE the "remote-debugging-port"
+                # string xref inside the function, so we must start from the prologue.
                 # Then find the next BL (0x94xxxxxx encoding) = outer wrapper.
                 # Also capture the preceding ADRP+ADD target = vtable.
-                scan_start = ref_fo
-                scan_end   = min(scan_start + 0x400, setup_prologue_fo + setup_fn_size)
+                scan_start = setup_prologue_fo
+                scan_end   = setup_prologue_fo + min(setup_fn_size, 0x800)
                 vtable_candidate = None
                 for fo in range(scan_start, scan_end, 4):
                     if fo + 4 > len(data):
@@ -939,9 +941,11 @@ def _frida_scan_offsets(arch: str) -> dict:
                 if (!setupFn) continue;
                 errs.push('devtools_start: setup fn at ' + setupFn.sub(base).toString(16));
 
-                // Scan forward from rdpAddr up to 0x400 bytes for MOV Wn, #0x2475
-                var scanFwd = 0x400;
-                var fwdBuf = rdpAddr.readByteArray(scanFwd);
+                // Scan the ENTIRE setup function body for MOV Wn, #0x2475.
+                // NOTE: 0x2475 is written BEFORE the rdpAddr xref in the function,
+                // so we must scan from the function prologue, not from rdpAddr.
+                var scanFwd = 0x800;
+                var fwdBuf = setupFn.readByteArray(scanFwd);
                 var fwdArr = new Uint32Array(fwdBuf);
                 for (var fi = 0; fi < fwdArr.length && !results.devtools_start; fi++) {
                     var finstr = fwdArr[fi];
@@ -954,7 +958,7 @@ def _frida_scan_offsets(arch: str) -> dict:
                             if ((blinstr >>> 26) === 0x25) {
                                 var imm26 = blinstr & 0x3FFFFFF;
                                 if (imm26 & (1 << 25)) imm26 = imm26 - (1 << 26);
-                                var blPtr = rdpAddr.add(bli * 4);
+                                var blPtr = setupFn.add(bli * 4);
                                 var targetPtr = blPtr.add(imm26 * 4);
                                 results.devtools_start = targetPtr.sub(base).toString(16);
                                 errs.push('devtools_start: outer wrapper at ' + results.devtools_start);
