@@ -132,6 +132,29 @@ sudo python3 ~/chroma/chroma.py --offset devtools_start=0x2ED62AC --offset handl
 
 ---
 
+## Second crash (solved in 9ec39d8)
+
+### The crash
+`EXC_BAD_ACCESS (SIGBUS) / EXC_ARM_DA_ALIGN` at `0x84aed33800000001` in Thread 43 (injected dylib).
+
+### Root cause
+On Apple Silicon (arm64/arm64e), `__DATA_CONST,__const` vtable entries are PAC-signed by dyld
+at load time via `PACIA`. Writing the raw on-disk address into `fc[0]` bypasses PAC — when
+`sub_2ED62AC` does `BLRAA x8, x0` the auth fails → PC = corrupted pointer with bit0=1.
+
+On-disk value (chained fixup format, NOT a pointer): e.g. `0x004000000af9b970`  
+Runtime value after dyld: PAC-signed absolute pointer (different bits, signed)
+
+### Fix
+Read the vtable pointer from live process memory (already resolved + PAC-signed by dyld):
+- **Frida**: `fc.writePointer(ptr(rt.handler_vtable).readPointer())`  
+- **Mach dylib**: `*(void**)fc = **(void***)<addr>`
+
+### Cache
+`~/.chroma/offsets.json` was manually cleared. On next run it will rescan for `.116-arm64`.
+
+---
+
 ## Immediate next step
 
 Run `sudo python3 chroma.py --scan` and verify:
