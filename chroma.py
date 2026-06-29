@@ -1577,9 +1577,10 @@ def activate_lldb(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: st
 
 def _import_frida():
     """
-    Import frida, trying Homebrew site-packages if the default import fails.
-    This handles `sudo python3` which may use /usr/bin/python3 instead of
-    the Homebrew python that has frida installed.
+    Import frida, trying multiple locations in order:
+    1. Already importable (current sys.path)
+    2. Local .venv next to this script (created via: python3 -m venv .venv && .venv/bin/pip install frida)
+    3. Homebrew site-packages (arm64 /opt/homebrew, x86_64 /usr/local)
     """
     try:
         import frida
@@ -1587,14 +1588,21 @@ def _import_frida():
     except ImportError:
         pass
 
-    # Try known Homebrew paths (arm64 + x86_64 prefixes)
-    homebrew_roots = [
-        "/opt/homebrew/lib",           # arm64 (Apple Silicon)
-        "/usr/local/lib",              # x86_64 (Intel)
-    ]
-    import importlib, importlib.util, glob as _glob, sys as _sys
+    import importlib, glob as _glob, sys as _sys, os as _os
 
-    for root in homebrew_roots:
+    # 1. Local .venv adjacent to this script (most reliable under sudo)
+    _script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    for _venv_sp in _glob.glob(_os.path.join(_script_dir, ".venv/lib/python*/site-packages")):
+        if _venv_sp not in _sys.path:
+            _sys.path.insert(0, _venv_sp)
+        try:
+            import frida
+            return frida
+        except ImportError:
+            continue
+
+    # 2. Homebrew site-packages (arm64 + x86_64)
+    for root in ["/opt/homebrew/lib", "/usr/local/lib"]:
         for sp in _glob.glob(f"{root}/python3*/site-packages"):
             if sp not in _sys.path:
                 _sys.path.insert(0, sp)
@@ -1605,9 +1613,9 @@ def _import_frida():
                 continue
 
     raise RuntimeError(
-        "frida not importable — run: pip install frida\n"
-        "If using sudo, ensure frida is installed for the system python:\n"
-        "  sudo /opt/homebrew/bin/pip3 install frida"
+        "frida not importable.\n"
+        "Fix: cd ~/chroma && python3 -m venv .venv && .venv/bin/pip install frida\n"
+        "Then run: sudo ~/chroma/.venv/bin/python3 chroma.py"
     )
 
 
@@ -1641,16 +1649,18 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
     if not rt.get("devtools_start"):
         raise RuntimeError("devtools_start offset required for frida backend")
 
+    fc_size = 0x10 if arch == "arm64" else 0x20   # arm64: vtable+port+flags only (16 bytes)
+
     JS = """
 (function() {
-    var rt = RT; var port = PORT;
+    var rt = RT; var port = PORT; var fcSize = FC_SIZE;
     try {
         var opNew  = new NativeFunction(ptr(rt.op_new), 'pointer', ['uint32']);
         var dstart = new NativeFunction(ptr(rt.devtools_start), 'void',
                                         ['pointer','pointer','pointer','uint32']);
         var sb = opNew(0x20); sb.writeByteArray(new Array(0x20).fill(0));
         var ab = opNew(0x50); ab.writeByteArray(new Array(0x50).fill(0));
-        var fc = opNew(0x20); fc.writeByteArray(new Array(0x20).fill(0));
+        var fc = opNew(fcSize); fc.writeByteArray(new Array(fcSize).fill(0));
         if (rt.handler_vtable) fc.writePointer(ptr(rt.handler_vtable));
         fc.add(8).writeU16(port); fc.add(10).writeU16(0x2475);
         if (rt.create_server_socket) {
@@ -1663,7 +1673,8 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
     } catch(e) { send('[chroma/frida] ERROR: ' + e.message); }
 })();
 """.replace("RT", json.dumps({k: hex(v) if v else None for k, v in rt.items()})) \
-   .replace("PORT", str(port))
+   .replace("PORT", str(port)) \
+   .replace("FC_SIZE", str(fc_size))
 
     msgs = []
     scr2 = session.create_script(JS)
