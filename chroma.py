@@ -335,11 +335,18 @@ def _arm64_adrp_refs(data: bytes, macho: dict, target_fileoff: int) -> list[int]
     return results
 
 
-def _walk_to_prologue(data: bytes, ref_fileoff: int, max_walk: int = 256) -> Optional[int]:
+def _walk_to_prologue(data: bytes, ref_fileoff: int, max_walk: int = 1024) -> Optional[int]:
     """
     Walk backwards from ref_fileoff to find the nearest function prologue.
     x86_64: look for PUSH RBP (0x55) followed by MOV RBP,RSP (0x48 0x89 0xE5)
-    arm64:  look for STP x29, x30 (common prologue pattern)
+    arm64:  look for either:
+      - SUB SP, SP, #N  (0xD1xxxxFF) — large stack frame, first instruction
+      - STP x29, x30, [sp, #-N]! (FD 7B xx A9) — frame pointer save
+    Chrome arm64 functions open with SUB SP (to allocate a large frame) *before*
+    the STP x29,x30 — so we must recognise SUB SP as a valid prologue start.
+    The default max_walk of 1024 covers functions whose first xref is up to ~256
+    instructions into the body (Chrome's DevToolsHttpHandler::Start is ~472 bytes
+    from its start to the DevToolsActivePort ADRP).
     """
     start = max(0, ref_fileoff - max_walk)
     window = data[start: ref_fileoff + 1]
@@ -350,14 +357,44 @@ def _walk_to_prologue(data: bytes, ref_fileoff: int, max_walk: int = 256) -> Opt
     if idx != -1:
         return start + idx
 
-    # arm64 prologue: STP x29, x30, [sp, #-N]!  → D1 xx xx F8 (approx)
-    # More precisely: FD 7B xx A9 (common encoding)
-    for i in range(len(window) - 4, -1, -1):
+    # arm64 — scan backwards in 4-byte steps (instructions are 32-bit fixed-width)
+    # Look for prologues — in order of preference (earliest wins):
+    #   1. SUB SP, SP, #imm12  → D1xxxxFF — large frame alloc, always the FIRST instruction
+    #   2. STP x29, x30, [sp, #-N]!  → FD 7B xx A9
+    #
+    # Strategy: scan backwards; when we hit STP x29,x30 keep looking a few more
+    # instructions in case there's a SUB SP just before it (it always precedes STP
+    # in large-frame functions like DevToolsHttpHandler::Start).
+    best = None
+    i = len(window) - 4
+    i -= (i % 4) if (i % 4) != 0 else 0
+    while i >= 0:
         b = window[i: i + 4]
-        if len(b) == 4 and b[0] == 0xFD and b[1] == 0x7B and b[3] == 0xA9:
-            return start + i
+        if len(b) == 4:
+            w = struct.unpack_from("<I", b)[0]
+            is_stp_fp = (b[0] == 0xFD and b[1] == 0x7B and b[3] == 0xA9)
+            is_sub_sp = ((w & 0xFF0003FF) == 0xD10003FF)
+            if is_sub_sp:
+                best = start + i
+                break  # SUB SP is definitively the first instruction — stop here
+            if is_stp_fp:
+                best = start + i
+                # Don't break: keep searching in case SUB SP precedes this STP
+                # (walk up to 16 more instructions = 64 bytes backwards)
+                inner = i - 4
+                limit = max(0, i - 64)
+                while inner >= limit:
+                    bb = window[inner: inner + 4]
+                    if len(bb) == 4:
+                        ww = struct.unpack_from("<I", bb)[0]
+                        if (ww & 0xFF0003FF) == 0xD10003FF:
+                            best = start + inner  # found SUB SP before the STP
+                            break
+                    inner -= 4
+                break  # stop outer scan after STP (with or without preceding SUB SP)
+        i -= 4
 
-    return None
+    return best
 
 
 def _find_vtable_rtti(data: bytes, macho: dict, class_substr: bytes) -> Optional[int]:
@@ -388,6 +425,24 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
     with open(fw_path, "rb") as f:
         data = f.read()
 
+    # For fat binaries, extract the target-arch slice so that all file offsets
+    # returned by _find_string_fileoffs, _arm64_adrp_refs, etc. are in the same
+    # coordinate space as the sfoff values stored by _macho_parse.  Previously
+    # we passed the whole fat blob to _find_string_fileoffs but slice-relative
+    # sfoff values to _arm64_adrp_refs — causing every string lookup to miss.
+    magic_be = struct.unpack_from(">I", data)[0]
+    if magic_be == 0xCAFEBABE:   # fat binary
+        CPU_TYPE = {"x86_64": 0x01000007, "arm64": 0x0100000C}
+        target_cpu = CPU_TYPE[arch]
+        narch = struct.unpack_from(">I", data, 4)[0]
+        for i in range(narch):
+            cputype, _, offset, size, _ = struct.unpack_from(">5I", data, 8 + i * 20)
+            if cputype == target_cpu:
+                data = data[offset: offset + size]   # now single-arch slice
+                break
+        else:
+            raise ValueError(f"arch {arch} not found in fat binary")
+
     macho = _macho_parse(data, arch)
     vm_base = macho["vm_base"]
     print(f"[chroma/scan] vm_base = 0x{vm_base:x}, sections: {list(macho['sections'].keys())}")
@@ -395,7 +450,23 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
     found: dict[str, Optional[int]] = {}
 
     # ── 1. Find DevToolsActivePort xrefs → locate devtools_start nearby ──────
+    # Collect ALL candidate prologues and pick the largest one.
+    # Chrome arm64 has two functions that reference DevToolsActivePort:
+    #   - a small helper (~0x148) that only reads the port file
+    #   - the real DevToolsHttpHandler::Start (~0x538+) that also refs "Listening on"
+    # Taking the first xref would silently return the wrong (small) function.
+    def _fo_to_fn_rel(prologue_fo):
+        """Convert a file-offset prologue to (fn_rel, fn_size). Returns None if no section match."""
+        for _name, (sva, ssz, sfoff) in macho["sections"].items():
+            if sfoff <= prologue_fo < sfoff + ssz:
+                fn_va = sva + (prologue_fo - sfoff)
+                # Approximate function size: distance to next section boundary
+                fn_size = (sfoff + ssz) - prologue_fo
+                return fn_va - vm_base, fn_size
+        return None
+
     print("[chroma/scan] searching for 'DevToolsActivePort' xrefs ...")
+    devtools_candidates: list[tuple[int, int]] = []  # (fn_rel, approx_size)
     string_fo_list = _find_string_fileoffs(data, b"DevToolsActivePort")
     for string_fo in string_fo_list:
         if arch == "x86_64":
@@ -406,19 +477,19 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
         for ref_fo in refs:
             prologue_fo = _walk_to_prologue(data, ref_fo)
             if prologue_fo is not None:
-                # Convert file offset → vmaddr
-                for name, (sva, ssz, sfoff) in macho["sections"].items():
-                    if sfoff <= prologue_fo < sfoff + ssz:
-                        fn_va = sva + (prologue_fo - sfoff)
-                        fn_rel = fn_va - vm_base
-                        print(f"[chroma/scan]   DevTools candidate: 0x{fn_rel:x} (via '{b'DevToolsActivePort'.decode()}')")
-                        if "devtools_start" not in found:
-                            found["devtools_start"] = fn_rel
+                hit = _fo_to_fn_rel(prologue_fo)
+                if hit:
+                    fn_rel, fn_size = hit
+                    print(f"[chroma/scan]   DevTools candidate: 0x{fn_rel:x} size~0x{fn_size:x} (via 'DevToolsActivePort')")
+                    devtools_candidates.append((fn_rel, fn_size))
 
-    # ── 2. Find "Listening on " xrefs → secondary devtools_start candidate ───
-    if "devtools_start" not in found:
-        print("[chroma/scan] searching for 'Listening on ' xrefs ...")
-        for string_fo in _find_string_fileoffs(data, b"Listening on "):
+    # ── 2. Find "Listening on " / "DevTools listening on" xrefs ─────────────
+    # These strings are exclusive to the real Start() function — use them to
+    # both discover and confirm the best candidate.
+    print("[chroma/scan] searching for 'Listening on ' xrefs ...")
+    listening_fns: set[int] = set()
+    for needle in (b"Listening on ", b"DevTools listening on"):
+        for string_fo in _find_string_fileoffs(data, needle):
             if arch == "x86_64":
                 refs = _x86_64_rip_refs(data, macho, string_fo)
             else:
@@ -426,13 +497,19 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
             for ref_fo in refs:
                 prologue_fo = _walk_to_prologue(data, ref_fo)
                 if prologue_fo is not None:
-                    for name, (sva, ssz, sfoff) in macho["sections"].items():
-                        if sfoff <= prologue_fo < sfoff + ssz:
-                            fn_va = sva + (prologue_fo - sfoff)
-                            fn_rel = fn_va - vm_base
-                            print(f"[chroma/scan]   DevTools candidate (listening): 0x{fn_rel:x}")
-                            if "devtools_start" not in found:
-                                found["devtools_start"] = fn_rel
+                    hit = _fo_to_fn_rel(prologue_fo)
+                    if hit:
+                        fn_rel, fn_size = hit
+                        print(f"[chroma/scan]   DevTools candidate (listening): 0x{fn_rel:x} size~0x{fn_size:x}")
+                        listening_fns.add(fn_rel)
+                        devtools_candidates.append((fn_rel, fn_size))
+
+    if devtools_candidates:
+        # Prefer a candidate confirmed by "Listening on" xref; fall back to largest.
+        confirmed = [c for c in devtools_candidates if c[0] in listening_fns]
+        best = max(confirmed or devtools_candidates, key=lambda c: c[1])
+        found["devtools_start"] = best[0]
+        print(f"[chroma/scan]   → devtools_start selected: 0x{best[0]:x} (size~0x{best[1]:x}{'  ✓ confirmed by Listening-on xref' if best[0] in listening_fns else ''})")
 
     # ── 3. operator new — always resolved via libc++ export (no offset) ───────
     # Stored as None to signal "use dlsym" path
@@ -466,7 +543,42 @@ def discover_offsets(fw_path: str, arch: str, force: bool = False) -> Optional[d
                         break
                     idx += step
 
-    # ── 5. Vtable — scan for known RTTI name ─────────────────────────────────
+    # ── 5a. Vtable — derive from devtools_start body (arm64 primary path) ───
+    # In Chrome arm64, DevToolsHttpHandler::Start does:
+    #   ADRL X10, <vtable>  ; STP X10, X22, [X23]
+    # where <vtable> is in __DATA_CONST,__const.  Since we already found
+    # devtools_start above, scan its first ~0x200 instructions for the first
+    # ADRP+ADD pair that targets __DATA_CONST,__const — that's the vtable ptr.
+    if arch == "arm64" and found.get("devtools_start") and "handler_vtable" not in found:
+        fn_fo   = found["devtools_start"]  # vm_base=0, so fo == va
+        fn_end  = fn_fo + 0x800            # generous upper bound
+        text_va, text_sz, text_fo = macho["sections"].get("__TEXT,__text", (0, 0, 0))
+        dc_va,  dc_sz,  dc_fo  = macho["sections"].get(
+            "__DATA_CONST,__const", macho["sections"].get("__DATA,__const", (0, 0, 0))
+        )
+        print("[chroma/scan] deriving handler_vtable from devtools_start body ...")
+        if dc_sz:
+            for fo in range(fn_fo, min(fn_end, text_fo + text_sz), 4):
+                instr = struct.unpack_from("<I", data, fo)[0]
+                if (instr & 0x9F000000) == 0x90000000:
+                    immhi  = (instr >> 5) & 0x7FFFF
+                    immlo  = (instr >> 29) & 0x3
+                    imm    = ((immhi << 2) | immlo) << 12
+                    if imm & (1 << 32):
+                        imm -= (1 << 33)
+                    instr_va  = text_va + (fo - text_fo)
+                    page_va   = (instr_va & ~0xFFF) + imm
+                    next_w    = struct.unpack_from("<I", data, fo + 4)[0]
+                    if (next_w & 0xFF800000) == 0x91000000:
+                        add_imm   = (next_w >> 10) & 0xFFF
+                        target_va = page_va + add_imm
+                        if dc_va <= target_va < dc_va + dc_sz:
+                            vtbl_rel = target_va - vm_base
+                            print(f"[chroma/scan]   handler_vtable from devtools body: 0x{vtbl_rel:x}")
+                            found["handler_vtable"] = vtbl_rel
+                            break
+
+    # ── 5b. Vtable — scan for known RTTI name (x86_64 / fallback) ────────────
     print("[chroma/scan] searching for TCPServerSocketFactory vtable ...")
     # The mangled RTTI name for TCPServerSocketFactory or DevToolsHttpHandlerFactory
     rtti_candidates = [
