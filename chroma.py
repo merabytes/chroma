@@ -1658,11 +1658,12 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
         raise RuntimeError("devtools_start offset required for frida backend")
 
     fc_size = 0x10 if arch == "arm64" else 0x20   # arm64: vtable+port+flags only (16 bytes)
+    rt_json = json.dumps({k: hex(v) if v else None for k, v in rt.items()})
 
-    JS = """
-(function() {
-    var rt = RT; var port = PORT; var fcSize = FC_SIZE;
-    try {
+    JS = f"""
+(function() {{
+    var rt = {rt_json}; var port = {port}; var fcSize = {fc_size};
+    try {{
         var opNew  = new NativeFunction(ptr(rt.op_new), 'pointer', ['uint32']);
         var dstart = new NativeFunction(ptr(rt.devtools_start), 'void',
                                         ['pointer','pointer','pointer','uint32']);
@@ -1671,18 +1672,16 @@ def activate_frida(pid: int, port: int, offsets_rel: dict, fw_path: str, arch: s
         var fc = opNew(fcSize); fc.writeByteArray(new Array(fcSize).fill(0));
         if (rt.handler_vtable) fc.writePointer(ptr(rt.handler_vtable));
         fc.add(8).writeU16(port); fc.add(10).writeU16(0x2475);
-        if (rt.create_server_socket) {
+        if (rt.create_server_socket) {{
             var csock = new NativeFunction(ptr(rt.create_server_socket),
                                             'uint8', ['uint32','pointer']);
             csock(port, sb);
-        }
+        }}
         dstart(fc, sb, ab, 0);
         send('[chroma/frida] DevToolsHttpHandler::Start called');
-    } catch(e) { send('[chroma/frida] ERROR: ' + e.message); }
-})();
-""".replace("RT", json.dumps({k: hex(v) if v else None for k, v in rt.items()})) \
-   .replace("PORT", str(port)) \
-   .replace("FC_SIZE", str(fc_size))
+    }} catch(e) {{ send('[chroma/frida] ERROR: ' + e.message); }}
+}})();
+"""
 
     msgs = []
     scr2 = session.create_script(JS)
